@@ -1,0 +1,346 @@
+#############################################################################
+# nav2_params.yaml - PearlGuard (pguard_x) - ROS2 Humble
+#
+# Hypotheses de cette config :
+#   - Tu as maintenant une carte sauvegardee (pguard_map.pgm/.yaml), donc
+#     cette version utilise map_server + amcl (localisation sur carte fixe),
+#     PAS slam_toolbox en ligne. C'est le setup standard pour la phase
+#     "navigation" une fois la carte construite.
+#   - odom -> base_footprint est deja publie par les plugins
+#     gazebo_ros_diff_drive (voir tes commentaires [PGUARD_X]).
+#   - Footprint = boite de collision reelle du chassis (1.4 x 0.75 x 0.60,
+#     decalee de x=+0.10 par rapport a base_link), PAS une approximation
+#     circulaire comme dans ton safety_buffer_ custom. C'est plus precis
+#     mais un peu plus couteux en calcul (verification polygonale).
+#   - Planificateur global : SmacPlannerHybrid (equivalent standard Nav2 le
+#     plus proche de ton PRM -- il n'existe pas de plugin RRT/PRM natif).
+#   - Controleur local : DWB (l'equivalent officiel Nav2 de DWA).
+#   - Alternatives MPPI / TEB donnees en commentaire en bas de fichier pour
+#     comparaison ulterieure.
+#############################################################################
+
+map_server:
+  ros__parameters:
+    use_sim_time: True
+    yaml_filename: ""   # surcharge via l'argument de launch 'map' (voir launch file)
+
+amcl:
+  ros__parameters:
+    use_sim_time: True
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+    base_frame_id: "base_footprint"
+    global_frame_id: "map"
+    odom_frame_id: "odom"
+    scan_topic: scan
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+    max_particles: 2000
+    min_particles: 500
+    laser_max_range: 20.0
+    laser_min_range: 0.45   # coherent avec min_range du VLP-16 dans robot_pguard_x.xacro
+    laser_model_type: "likelihood_field"
+    update_min_a: 0.2
+    update_min_d: 0.25
+    resample_interval: 1
+    transform_tolerance: 1.0
+    tf_broadcast: true
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: True
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: /odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    # BT par defaut fourni par nav2_bt_navigator (navigate_to_pose + recovery)
+    default_nav_to_pose_bt_xml: "navigate_to_pose_w_replanning_and_recovery.xml"
+    default_nav_through_poses_bt_xml: "navigate_through_poses_w_replanning_and_recovery.xml"
+
+controller_server:
+  ros__parameters:
+    use_sim_time: True
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.5
+      movement_time_allowance: 10.0
+
+    general_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      # Correspond a ton goal_tolerance_ = 0.12 dans prm_nav_node.cpp
+      xy_goal_tolerance: 0.12
+      yaw_goal_tolerance: 0.15
+      stateful: True
+
+    # -------------------------------------------------------------------
+    # DWB = equivalent officiel Nav2 de ton DwaLocalPlanner.
+    # Les criticis ci-dessous recreent l'esprit de tes FIX 19/23 :
+    #   - BaseObstacle + ObstacleFootprint = ton rejet dur de securite
+    #   - PathAlign + PathDist            = ton adherence au chemin global
+    #   - GoalAlign + GoalDist            = ton heading_cost / goal_cost
+    #   - PreferForward                   = ta recompense de vitesse
+    #     (empeche le "robot freezing problem" que tu decrivais)
+    #   - RotateToGoal                    = ton mode "approche finale"
+    # -------------------------------------------------------------------
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: True
+      # Bornes de vitesse : identiques a tes parametres max_linear_vel/max_angular_vel
+      min_vel_x: -0.04          # leger recul autorise, comme v_min = -max_linear_vel_*0.1
+      min_vel_y: 0.0
+      max_vel_x: 0.4
+      max_vel_y: 0.0
+      max_vel_theta: 1.0
+      min_speed_xy: 0.0
+      max_speed_xy: 0.4
+      min_speed_theta: 0.0
+      acc_lim_x: 0.5
+      acc_lim_y: 0.0
+      acc_lim_theta: 1.5
+      decel_lim_x: -0.5
+      decel_lim_y: 0.0
+      decel_lim_theta: -1.5
+      vx_samples: 20
+      vy_samples: 1
+      vtheta_samples: 20
+      sim_time: 1.7
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.2
+      xy_goal_tolerance: 0.12
+      trans_stopped_velocity: 0.1
+      short_circuit_trajectory_evaluation: True
+      stateful: True
+      critics:
+        [
+          "RotateToGoal",
+          "Oscillation",
+          "BaseObstacle",
+          "ObstacleFootprint",
+          "GoalAlign",
+          "PathAlign",
+          "PathDist",
+          "GoalDist",
+          "PreferForward",
+        ]
+      BaseObstacle.scale: 0.02
+      ObstacleFootprint.scale: 0.02
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.325
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.325
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+      PreferForward.scale: 1.5    # equivalent de dwa_velocity_weight_ (FIX 19)
+      Oscillation.scale: 1.0
+
+planner_server:
+  ros__parameters:
+    use_sim_time: True
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+
+    # -------------------------------------------------------------------
+    # SmacPlannerHybrid : planificateur global standard le plus proche de
+    # ton PRM (pas d'echantillonnage aleatoire, mais recherche sur graphe
+    # avec contraintes cinematiques -- adapte a un robot 4 roues non
+    # holonome comme pguard_x). Rejette aussi les trajectoires trop pres
+    # des obstacles via l'inflation layer du costmap (voir plus bas),
+    # comme ton safe_cost_threshold_.
+    # -------------------------------------------------------------------
+    GridBased:
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      downsample_costmap: false
+      downsampling_factor: 1
+      tolerance: 0.25
+      allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 3.0            # equivalent de ton prm_solve_time_
+      motion_model_for_search: "REEDS_SHEPP"
+      angle_quantization_bins: 72
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 3.0
+      minimum_turning_radius: 0.60      # a affiner selon le rayon de braquage reel de pguard_x
+      reverse_penalty: 2.0
+      change_penalty: 0.0
+      non_straight_penalty: 1.2
+      cost_penalty: 2.0
+      retrospective_penalty: 0.015
+      lookup_table_size: 20.0
+      cache_obstacle_heuristic: false
+      smooth_path: true
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: True
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    global_frame: odom
+    robot_base_frame: base_footprint
+    transform_timeout: 0.5
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 1.0
+    min_rotational_vel: 0.2
+    rotational_acc_lim: 1.5
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: True
+    loop_rate: 20
+    stop_on_failure: false
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200
+
+# ---------------------------------------------------------------------------
+# COSTMAPS
+# Footprint reel (polygone), pas un rayon : coin avant/arriere derives de ta
+# boite de collision <box size="1.4 0.75 0.60"/> centree en x=0.10 (voir
+# ton commentaire [PGUARD_X] dans prm_nav_node.cpp) :
+#   avant = 0.10 + 1.4/2 = 0.80 m,  arriere = 0.10 - 1.4/2 = -0.60 m
+#   demi-largeur = 0.75/2 = 0.375 m
+# ---------------------------------------------------------------------------
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: True
+      global_frame: odom
+      robot_base_frame: base_footprint
+      update_frequency: 5.0
+      publish_frequency: 5.0
+      rolling_window: true
+      width: 6
+      height: 6
+      resolution: 0.05
+      footprint: "[[0.80,0.375],[0.80,-0.375],[-0.60,-0.375],[-0.60,0.375]]"
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 20.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 15.0
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 1.2       # identique a ton inflation_radius_
+      always_send_full_costmap: True
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: True
+      global_frame: map
+      robot_base_frame: base_footprint
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      resolution: 0.05
+      footprint: "[[0.80,0.375],[0.80,-0.375],[-0.60,-0.375],[-0.60,0.375]]"
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 20.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 15.0
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 1.2
+      always_send_full_costmap: True
+
+#############################################################################
+# ALTERNATIVES POUR COMPARAISON ULTERIEURE (non actives par defaut)
+#
+# --- Option A : remplacer FollowPath par MPPI (le plus moderne, souvent
+#     plus robuste sur costmap bruite comme le tien avec le VLP-16 reel) ---
+#
+# controller_server:
+#   ros__parameters:
+#     controller_plugins: ["FollowPath"]
+#     FollowPath:
+#       plugin: "nav2_mppi_controller::MPPIController"
+#       time_steps: 56
+#       model_dt: 0.05
+#       batch_size: 2000
+#       vx_std: 0.2
+#       vy_std: 0.0
+#       wz_std: 0.4
+#       vx_max: 0.4
+#       vx_min: -0.04
+#       wz_max: 1.0
+#       critics: ["ConstraintCritic","CostCritic","GoalCritic","GoalAngleCritic",
+#                 "PathAlignCritic","PathFollowCritic","PathAngleCritic","PreferForwardCritic"]
+#
+# --- Option B : TEB (necessite le paquet teb_local_planner pour ROS2,
+#     verifier son etat de maintenance sur Humble avant de s'engager) ---
+#
+# controller_server:
+#   ros__parameters:
+#     controller_plugins: ["FollowPath"]
+#     FollowPath:
+#       plugin: "teb_local_planner::TebLocalPlannerROS"
+#       max_vel_x: 0.4
+#       max_vel_theta: 1.0
+#       min_obstacle_dist: 0.95   # equivalent de ton safety_buffer_
+#       inflation_dist: 1.2
+#############################################################################

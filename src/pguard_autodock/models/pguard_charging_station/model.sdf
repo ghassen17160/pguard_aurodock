@@ -1,0 +1,96 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="pguard_charging_station">
+    <static>true</static>
+
+    <!--
+      Convention geometrique de ce modele :
+        - Le corps de la station est centre sur l'origine du modele.
+        - Le panneau AprilTag est mure sur la face +X de la station, tourne
+          vers l'exterieur (le robot doit approcher depuis +X, dans le repere
+          du modele, et s'arreter face au panneau).
+        - Lors du spawn (voir launch/spawn_station.launch.py), l'argument
+          "yaw" du modele fixe donc la direction depuis laquelle le robot
+          doit approcher dans le repere du monde/carte.
+      Dimensions et hauteur du tag a adapter (tag_z ci-dessous) pour
+      correspondre a la hauteur reelle de camera_link sur le robot.
+    -->
+
+    <link name="base">
+      <!-- Corps principal de la station (socle + colonne) -->
+      <visual name="body_visual">
+        <pose>0 0 0.25 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.35 0.30 0.50</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.15 0.15 0.18 1</ambient>
+          <diffuse>0.2 0.2 0.24 1</diffuse>
+          <specular>0.1 0.1 0.1 1</specular>
+        </material>
+      </visual>
+
+      <collision name="body_collision">
+        <pose>0 0 0.25 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.35 0.30 0.50</size>
+          </box>
+        </geometry>
+      </collision>
+
+      <!-- Bande de contact avant (repere visuel pour l'alignement final, non
+           fonctionnelle electriquement en simulation, purement visuelle) -->
+      <visual name="contact_strip_visual">
+        <pose>0.176 0 0.15 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.20 0.06</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.8 0.6 0.0 1</ambient>
+          <diffuse>0.9 0.7 0.0 1</diffuse>
+        </material>
+      </visual>
+
+      <!--
+        Panneau porte-tag : boite fine sur la face +X, a la hauteur tag_z.
+        Le materiau applique le PNG genere par scripts/generate_apriltag_image.py
+        (tag36h11, id=0) sur les faces de cette boite - seule la face +X est
+        vue par le robot qui approche, ce qui suffit largement en pratique.
+      -->
+      <visual name="apriltag_panel_visual">
+        <pose>0.181 0 0.40 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.01 0.16 0.16</size>
+          </box>
+        </geometry>
+        <material>
+          <script>
+            <uri>model://pguard_charging_station/materials/scripts</uri>
+            <uri>model://pguard_charging_station/materials/textures</uri>
+            <name>AprilTag/Tag36h11_00</name>
+          </script>
+        </material>
+      </visual>
+
+      <!-- Cadre blanc autour du panneau, ameliore le contraste/la detection -->
+      <visual name="apriltag_frame_visual">
+        <pose>0.177 0 0.40 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.005 0.20 0.20</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 1 1 1</ambient>
+          <diffuse>1 1 1 1</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

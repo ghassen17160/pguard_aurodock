@@ -1,0 +1,15 @@
+# Definition des tags connus pour apriltag_ros.
+#
+# "size" est la taille du COTE NOIR INTERIEUR du tag en metres (pas la taille
+# totale du panneau avec la marge blanche). Dans model.sdf, le panneau fait
+# 0.16 x 0.16 m -- adapte cette valeur si tu changes la taille du panneau.
+#
+# tag_frame_prefix / tag_frame_suffix determinent le nom de la frame TF
+# publiee par apriltag_ros pour chaque tag detecte : par defaut
+# "tag36h11:<id>". Le noeud autodock_node (pguard_autodock) attend ce nommage
+# par defaut ; ajuste le parametre 'tag_frame_override' cote autodock si ta
+# version d'apriltag_ros nomme les frames differemment.
+
+tag:
+  size: 0.16
+  ids: [0]

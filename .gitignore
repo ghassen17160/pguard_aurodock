@@ -1,0 +1,24 @@
+# Dossiers generes par colcon -- ne jamais versionner
+build/
+install/
+log/
+
+# Cache ROS2 / rosdep
+.catkin_tools/
+.colcon/
+
+# Fichiers Python compiles
+__pycache__/
+*.pyc
+
+# Fichiers d'IDE
+.vscode/
+.idea/
+*.swp
+
+# Fichiers systeme
+.DS_Store
+Thumbs.db
+
+# Logs divers
+*.log

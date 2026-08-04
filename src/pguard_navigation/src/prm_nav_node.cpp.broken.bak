@@ -1,0 +1,1642 @@
+#include <rclcpp/rclcpp.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <vector>
+#include <set>
+#include <cmath>
+#include <limits>
+#include <algorithm>
+#include <memory>
+#include <ompl/base/SpaceInformation.h>
+#include <ompl/base/spaces/RealVectorStateSpace.h>
+#include <ompl/base/objectives/PathLengthOptimizationObjective.h>
+#include <ompl/geometric/planners/rrt/RRTstar.h>
+#include <ompl/geometric/PathGeometric.h>
+#include <nav_msgs/msg/occupancy_grid.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <visualization_msgs/msg/marker.hpp>
+#include <sstream>
+#include <iomanip>
+
+namespace ob = ompl::base;
+namespace og = ompl::geometric;
+
+// ============================================================================
+// CHANGELOG v2 (migration PRM -> RRT* + corrections radicales)
+// ============================================================================
+// [MAJOR] og::PRM remplacé par og::RRTstar.
+//         - RRT* est incrémental et anytime : pas de construction d'un
+//           roadmap complet avant de pouvoir répondre, on récupère la
+//           meilleure solution trouvée dans le budget de temps imparti.
+//         - Objectif d'optimisation explicite (longueur de chemin) attaché
+//           au ProblemDefinition via ob::PathLengthOptimizationObjective.
+//         - "range" (pas d'extension de l'arbre) et "goal bias" exposés en
+//           paramètres ROS pour pouvoir régler la vitesse de convergence
+//           sans recompiler (rrt_range, rrt_goal_bias).
+//         - setStateValidityCheckingResolution() calculé comme une FRACTION
+//           de l'étendue max de l'espace (ce que OMPL attend réellement),
+//           et non plus une distance absolue divisée à la volée : l'ancien
+//           code passait une distance en mètres là où OMPL attend un ratio
+//           dans [0,1], ce qui pouvait sous- ou sur-échantillonner la
+//           vérification de collision selon la taille de la carte.
+// [FIX 10] inflation_radius_ n'est plus un paramètre libre et arbitraire :
+//          il est dérivé de robot_radius + inflation_margin (cf. YAML).
+//          Avant, rien ne garantissait que inflation_radius corresponde à
+//          la géométrie réelle du robot -> soit trop petit (collisions),
+//          soit trop grand (chemins refusés inutilement).
+// [FIX 11] Seuil d'occupation utilisé par le state validity checker exposé
+//          en paramètre (planner_occ_threshold) au lieu d'être hardcodé à
+//          5.0 dans le code.
+// [FIX 12] (héritées de la version précédente, conservées à l'identique)
+//          - yaw initial de trajectoire DWA basé sur le cap réel du robot.
+//          - obstacles dynamiques projetés une seule fois par scan (10 Hz),
+//            réutilisés tels quels par le DWA (20 Hz), au lieu d'être
+//            recalculés pour chaque trajectoire candidate.
+//          - scan_stride pour sous-échantillonner le nuage utilisé par DWA.
+//          - v_step / w_step DWA exposés en paramètres ROS.
+//          - DWA et costmap utilisent tous les deux tf_buffer_->lookupTransform
+//            vers map_frame_, sans hypothèse sur le frame_id réel du scan
+//            (base_link vs base_footprint) ni sur odom_pose == pose base_link.
+//          - goal_callback compare le frame_id du goal au paramètre
+//            map_frame_ configurable, plus de "map" en dur.
+//          - offset_x_/offset_y_ calculés dès la première odométrie reçue,
+//            pas seulement au premier execute_planner() (qui ne se
+//            déclenche qu'après acceptation d'un premier goal) : sinon le
+//            tout premier goal est validé avec un offset resté à 0.0.
+//          - debounce sur goal_callback : un nouveau goal à moins de 5cm du
+//            goal courant est ignoré (évite le double-clic / doublon DDS
+//            qui resetait path_indices_ en boucle sans jamais progresser).
+// [NOTE]   La fenêtre de costmap est centrée UNE FOIS sur la position de
+//          départ et sa taille reste fixe pendant toute l'exécution.
+//          Dimensionnez map_width/map_height/resolution selon la taille
+//          réelle de votre environnement (voir README).
+// [NOTE]   Le YAML doit maintenant fournir robot_radius / inflation_margin
+//          / planner_occ_threshold / planner_solve_time / rrt_range /
+//          rrt_goal_bias. L'ancien paramètre "inflation_radius" n'est plus
+//          lu et n'a plus aucun effet s'il reste dans le fichier.
+// ============================================================================
+
+// Visualization helper class
+class GridViz {
+public:
+ void set_color(int index, const std::string& color) {
+ RCLCPP_DEBUG(rclcpp::get_logger("rrtstar_nav"), "Set color of node %d to %s", index, color.c_str());
+ }
+};
+
+// Utility functions
+int coords_to_index(double x, double y, int width, double resolution, double offset_x, double offset_y) {
+ int grid_x = static_cast<int>(std::round((x - offset_x) / resolution));
+ int grid_y = static_cast<int>(std::round((y - offset_y) / resolution));
+ return grid_y * width + grid_x;
+}
+
+bool is_collision_free(int index, const std::vector<double>& costmap, int width, int height) {
+    if (index < 0 || index >= static_cast<int>(costmap.size())) {
+        return false;
+    }
+    int x = index % width;
+    int y = index / width;
+    if (x < 0 || x >= width || y < 0 || y >= height) {
+        return false;
+    }
+
+    return costmap[index] < 8.0;
+}
+
+double compute_path_length(const std::vector<int>& path, int width, double resolution, double offset_x, double offset_y) {
+ double length = 0.0;
+ for (size_t i = 1; i < path.size(); ++i) {
+ int idx1 = path[i-1];
+ int idx2 = path[i];
+ double x1 = (idx1 % width) * resolution + offset_x;
+ double y1 = (idx1 / width) * resolution + offset_y;
+ double x2 = (idx2 % width) * resolution + offset_x;
+ double y2 = (idx2 / width) * resolution + offset_y;
+ length += std::sqrt(std::pow(x2 - x1, 2) + std::pow(y2 - y1, 2));
+ }
+ return length;
+}
+
+// Cubic Spline interpolation
+class CubicSpline {
+public:
+ CubicSpline(const std::vector<double>& x, const std::vector<double>& y) {
+ size_t n = x.size();
+ if (n < 2 || x.size() != y.size()) {
+ RCLCPP_ERROR(rclcpp::get_logger("rrtstar_nav"), "Invalid spline input: size=%zu", n);
+ return;
+ }
+
+ std::vector<double> h(n-1), alpha(n-1), l(n), mu(n), z(n);
+ a_ = y;
+ b_.resize(n-1);
+ c_.resize(n);
+ d_.resize(n-1);
+
+ for (size_t i = 0; i < n-1; ++i) {
+ h[i] = x[i+1] - x[i];
+ if (h[i] <= 0.0) {
+ RCLCPP_ERROR(rclcpp::get_logger("rrtstar_nav"), "Non-monotonic x values at index %zu", i);
+ return;
+ }
+ }
+
+ for (size_t i = 1; i < n-1; ++i) {
+ alpha[i] = 3.0 * ((y[i+1] - y[i]) / h[i] - (y[i] - y[i-1]) / h[i-1]);
+ }
+
+ l[0] = 1.0;
+ mu[0] = 0.0;
+ z[0] = 0.0;
+
+ for (size_t i = 1; i < n-1; ++i) {
+ l[i] = 2.0 * (x[i+1] - x[i-1]) - h[i-1] * mu[i-1];
+ mu[i] = h[i] / l[i];
+ z[i] = (alpha[i] - h[i-1] * z[i-1]) / l[i];
+ }
+
+ l[n-1] = 1.0;
+ z[n-1] = 0.0;
+ c_[n-1] = 0.0;
+
+ for (int j = n-2; j >= 0; --j) {
+ c_[j] = z[j] - mu[j] * c_[j+1];
+ b_[j] = (y[j+1] - y[j]) / h[j] - h[j] * (c_[j+1] + 2.0 * c_[j]) / 3.0;
+ d_[j] = (c_[j+1] - c_[j]) / (3.0 * h[j]);
+ }
+ }
+
+ double interpolate(double x, const std::vector<double>& x_orig) const {
+ if (x_orig.empty()) return 0.0;
+ size_t n = x_orig.size();
+ size_t i = 0;
+ for (; i < n-1; ++i) {
+ if (x <= x_orig[i+1]) break;
+ }
+ if (i >= n-1) i = n-2;
+
+ double dx = x - x_orig[i];
+ return a_[i] + b_[i] * dx + c_[i] * dx * dx + d_[i] * dx * dx * dx;
+ }
+
+private:
+ std::vector<double> a_, b_, c_, d_;
+};
+
+// OMPL state validity checker
+class CostmapValidityChecker : public ob::StateValidityChecker {
+public:
+    CostmapValidityChecker(const ob::SpaceInformationPtr& si,
+                          const std::vector<double>& costmap,
+                          int width, int height,
+                          double resolution,
+                          double offset_x, double offset_y,
+                          double occ_threshold)
+        : ob::StateValidityChecker(si),
+          costmap_(costmap),
+          width_(width),
+          height_(height),
+          resolution_(resolution),
+          offset_x_(offset_x),
+          offset_y_(offset_y),
+          occ_threshold_(occ_threshold) {}
+
+    bool isValid(const ob::State* state) const override {
+        const auto* rvs = state->as<ob::RealVectorStateSpace::StateType>();
+        if (!rvs) return false;
+
+        double x = rvs->values[0];
+        double y = rvs->values[1];
+
+        int index = coords_to_index(x, y, width_, resolution_, offset_x_, offset_y_);
+
+        if (index < 0 || index >= static_cast<int>(costmap_.size())) {
+            return false;
+        }
+
+        return costmap_[index] < occ_threshold_;
+    }
+
+private:
+    const std::vector<double>& costmap_;
+    int width_, height_;
+    double resolution_, offset_x_, offset_y_;
+    double occ_threshold_;
+};
+
+// ============================================================================
+// RRT* planner (remplace l'ancien PRM)
+// ============================================================================
+std::vector<int> rrt_star_plan(int start_index, int goal_index, int width, int height,
+ const std::vector<double>& costmap, double resolution,
+ GridViz& grid_viz, double offset_x, double offset_y,
+ double solve_time, double occ_threshold,
+ double rrt_range, double rrt_goal_bias) {
+ std::vector<int> path;
+
+ if (costmap.empty() || start_index < 0 || goal_index < 0 ||
+ start_index >= static_cast<int>(costmap.size()) ||
+ goal_index >= static_cast<int>(costmap.size())) {
+ RCLCPP_ERROR(rclcpp::get_logger("rrtstar_nav"),
+ "Invalid input: start_index=%d, goal_index=%d, costmap_size=%zu",
+ start_index, goal_index, costmap.size());
+ return path;
+ }
+
+ double start_x = (start_index % width) * resolution + offset_x;
+ double start_y = (start_index / width) * resolution + offset_y;
+ double goal_x = (goal_index % width) * resolution + offset_x;
+ double goal_y = (goal_index / width) * resolution + offset_y;
+
+ auto space(std::make_shared<ob::RealVectorStateSpace>(2));
+ ob::RealVectorBounds bounds(2);
+ bounds.setLow(0, offset_x);
+ bounds.setHigh(0, offset_x + width * resolution);
+ bounds.setLow(1, offset_y);
+ bounds.setHigh(1, offset_y + height * resolution);
+ space->setBounds(bounds);
+
+ auto si(std::make_shared<ob::SpaceInformation>(space));
+ si->setStateValidityChecker(
+ std::make_shared<CostmapValidityChecker>(si, costmap, width, height, resolution, offset_x, offset_y, occ_threshold));
+
+ // IMPORTANT : OMPL attend ici une FRACTION de l'étendue maximale de
+ // l'espace (un ratio dans [0,1]), pas une distance absolue en mètres.
+ // L'ancienne version passait resolution/2.0 tel quel, ce qui sur une
+ // grande carte revenait à vérifier la collision quasiment jamais le long
+ // d'un segment, et sur une petite carte à la vérifier bien trop souvent.
+ double max_extent = space->getMaximumExtent();
+ double validity_fraction = (max_extent > 0.0)
+ ? std::max(0.0005, (resolution / 2.0) / max_extent)
+ : 0.01;
+ si->setStateValidityCheckingResolution(validity_fraction);
+ si->setup();
+
+ auto pdef(std::make_shared<ob::ProblemDefinition>(si));
+
+ ob::ScopedState<> start(space);
+ start[0] = start_x;
+ start[1] = start_y;
+ ob::ScopedState<> goal(space);
+ goal[0] = goal_x;
+ goal[1] = goal_y;
+ pdef->setStartAndGoalStates(start, goal, resolution * 2.0);
+
+ // RRT* est asymptotiquement optimal : on lui donne un objectif explicite
+ // (longueur de chemin) plutôt que de laisser OMPL en choisir un par défaut.
+ auto objective(std::make_shared<ob::PathLengthOptimizationObjective>(si));
+ pdef->setOptimizationObjective(objective);
+
+ auto planner(std::make_shared<og::RRTstar>(si));
+ planner->setProblemDefinition(pdef);
+ if (rrt_range > 0.0) {
+ planner->setRange(rrt_range);
+ }
+ planner->setGoalBias(rrt_goal_bias);
+ planner->setup();
+
+ ob::PlannerStatus solved = planner->ob::Planner::solve(solve_time);
+
+ if (solved) {
+ // RRT* est "anytime" : getSolutionPath() renvoie la meilleure solution
+ // trouvée jusqu'ici, même si le statut est APPROXIMATE_SOLUTION (le
+ // chemin se rapproche du but sans forcément l'atteindre exactement).
+ auto path_geom = pdef->getSolutionPath()->as<og::PathGeometric>();
+ if (path_geom) {
+ path_geom->interpolate(100);
+ for (size_t i = 0; i < path_geom->getStateCount(); ++i) {
+ const auto* state = path_geom->getState(i)->as<ob::RealVectorStateSpace::StateType>();
+ double x = state->values[0];
+ double y = state->values[1];
+ int index = coords_to_index(x, y, width, resolution, offset_x, offset_y);
+ if (is_collision_free(index, costmap, width, height)) {
+ path.push_back(index);
+ grid_viz.set_color(index, i == 0 ? "green" : (i == path_geom->getStateCount() - 1 ? "red" : "yellow"));
+ }
+ }
+ RCLCPP_INFO(rclcpp::get_logger("rrtstar_nav"),
+ "RRT* found a path with %zu nodes (exact=%s)",
+ path.size(),
+ solved == ob::PlannerStatus::EXACT_SOLUTION ? "yes" : "no (approximate)");
+ } else {
+ RCLCPP_WARN(rclcpp::get_logger("rrtstar_nav"), "No valid path found by RRT*");
+ }
+ } else {
+ RCLCPP_WARN(rclcpp::get_logger("rrtstar_nav"), "RRT* failed to find a path");
+ }
+
+ return path;
+}
+
+// Path simplification
+std::vector<int> simplify_path(const std::vector<int>& path, int width, int height, double resolution,
+    double offset_x, double offset_y, const std::vector<double>& costmap) {
+ if (path.size() < 3) return path;
+
+ std::vector<int> simplified;
+ simplified.push_back(path[0]);
+
+ auto is_segment_collision_free = [&](int idx1, int idx2) {
+ double x1 = (idx1 % width) * resolution + offset_x;
+ double y1 = (idx1 / width) * resolution + offset_y;
+ double x2 = (idx2 % width) * resolution + offset_x;
+ double y2 = (idx2 / width) * resolution + offset_y;
+
+ double dist = std::sqrt(std::pow(x2 - x1, 2) + std::pow(y2 - y1, 2));
+ int steps = static_cast<int>(dist / (resolution / 4.0)) + 1;
+ for (int i = 0; i <= steps; ++i) {
+ double t = static_cast<double>(i) / steps;
+ double x = x1 + t * (x2 - x1);
+ double y = y1 + t * (y2 - y1);
+ int idx = coords_to_index(x, y, width, resolution, offset_x, offset_y);
+ if (!is_collision_free(idx, costmap, width, height) || costmap[idx] > 5.0) {
+    return false;
+ }
+ }
+ return true;
+ };
+
+ size_t i = 0;
+ while (i < path.size() - 1) {
+ size_t j = path.size() - 1;
+ while (j > i + 1 && !is_segment_collision_free(path[i], path[j])) {
+ --j;
+ }
+ simplified.push_back(path[j]);
+ i = j;
+ }
+
+ RCLCPP_INFO(rclcpp::get_logger("rrtstar_nav"), "Simplified path from %zu to %zu points", path.size(), simplified.size());
+ return simplified;
+}
+
+// Smooth path
+std::vector<int> smooth_path(const std::vector<int>& raw_path, int width, int height,
+ double resolution, double offset_x, double offset_y,
+ const std::vector<double>& costmap) {
+ if (raw_path.size() < 2) return raw_path;
+
+ std::vector<std::pair<double, double>> coords;
+ std::vector<double> x_coords, y_coords, t_coords;
+ for (size_t i = 0; i < raw_path.size(); ++i) {
+ int idx = raw_path[i];
+ double x = (idx % width) * resolution + offset_x;
+ double y = (idx / width) * resolution + offset_y;
+ coords.emplace_back(x, y);
+ x_coords.push_back(x);
+ y_coords.push_back(y);
+ t_coords.push_back(static_cast<double>(i));
+ }
+
+ CubicSpline spline_x(t_coords, x_coords);
+ CubicSpline spline_y(t_coords, y_coords);
+
+ std::vector<std::pair<double, double>> smoothed_coords;
+ size_t n_points = raw_path.size() * 1.5;
+ double t_max = static_cast<double>(raw_path.size() - 1);
+ double dt = t_max / (n_points - 1);
+
+ for (size_t i = 0; i < n_points; ++i) {
+ double t = i * dt;
+ double x = spline_x.interpolate(t, t_coords);
+ double y = spline_y.interpolate(t, t_coords);
+ int idx = coords_to_index(x, y, width, resolution, offset_x, offset_y);
+ if (idx >= 0 && idx < static_cast<int>(costmap.size()) && costmap[idx] < 8.0) {
+ smoothed_coords.emplace_back(x, y);
+ } else {
+ size_t nearest_idx = static_cast<size_t>(std::round(t));
+ if (nearest_idx >= coords.size()) nearest_idx = coords.size() - 1;
+ smoothed_coords.push_back(coords[nearest_idx]);
+ }
+ }
+
+ std::vector<int> smoothed_path;
+ std::set<int> unique_indices;
+ for (const auto& [x, y] : smoothed_coords) {
+ int idx = coords_to_index(x, y, width, resolution, offset_x, offset_y);
+ if (unique_indices.insert(idx).second && is_collision_free(idx, costmap, width, height)) {
+ smoothed_path.push_back(idx);
+ }
+ }
+
+ return simplify_path(smoothed_path, width, height, resolution, offset_x, offset_y, costmap);
+}
+
+// ============================================================================
+// Local Planner (DWA)
+// Ne recalcule pas les positions d'obstacles à partir du scan brut : reçoit
+// directement une liste de points déjà projetés dans le repère map par
+// RRTStarNavNode::scan_callback (via TF, comme pour le costmap).
+// ============================================================================
+class LocalPlanner {
+public:
+ LocalPlanner(double max_linear_vel, double max_angular_vel, double resolution,
+ double local_window_size, double dt, int num_steps, double safety_buffer,
+ double v_step, double w_step, double heading_slowdown_min_factor,
+ double max_linear_decel, double velocity_smoothing_weight,
+ double heading_alignment_weight)
+ : max_linear_vel_(max_linear_vel),
+ max_angular_vel_(max_angular_vel),
+ resolution_(resolution),
+ local_window_size_(local_window_size),
+ dt_(dt),
+ safety_buffer_(safety_buffer),
+ num_steps_(num_steps),
+ v_step_(v_step),
+ w_step_(w_step),
+ heading_slowdown_min_factor_(heading_slowdown_min_factor),
+ max_linear_decel_(max_linear_decel),
+ velocity_smoothing_weight_(velocity_smoothing_weight),
+ heading_alignment_weight_(heading_alignment_weight) {}
+
+ struct Trajectory {
+ std::vector<std::pair<double, double>> points;
+ double cost;
+ double linear_vel;
+ double angular_vel;
+ double final_yaw = 0.0;
+ };
+
+ Trajectory compute_best_trajectory(
+ double current_x, double current_y, double current_yaw,
+ double target_x, double target_y,
+ const std::vector<double>& costmap, int width, int height,
+ double offset_x, double offset_y,
+ const std::vector<std::pair<double, double>>& obstacles_map,
+ double prev_v, double prev_w) {
+ Trajectory best_traj;
+ best_traj.cost = std::numeric_limits<double>::max();
+
+ double heading_error = std::atan2(target_y - current_y, target_x - current_x) - current_yaw;
+ heading_error = std::atan2(std::sin(heading_error), std::cos(heading_error));
+ double heading_factor = std::max(heading_slowdown_min_factor_, std::cos(heading_error));
+
+ // [FIX 14] Profil de freinage : plafonne v_max en fonction de la distance
+ // restante au but (v <= sqrt(2*a*d), profil de décélération classique).
+ // Sans ça le robot fonce à vitesse max puis doit décider brutalement quoi
+ // faire à quelques cm du but -> deux commandes très différentes peuvent
+ // avoir un coût quasi identique -> oscillation d'une frame à l'autre.
+ double dist_to_target = std::hypot(target_x - current_x, target_y - current_y);
+ double v_max_brake = std::sqrt(std::max(0.0, 2.0 * max_linear_decel_ * dist_to_target));
+
+ double v_min = -max_linear_vel_ * 0.1;
+ double v_max = std::min(max_linear_vel_ * heading_factor, std::max(0.05, v_max_brake));
+ double w_min = -max_angular_vel_;
+ double w_max = max_angular_vel_;
+
+ for (double v = v_min; v <= v_max; v += v_step_) {
+ for (double w = w_min; w <= w_max; w += w_step_) {
+ Trajectory traj = simulate_trajectory(current_x, current_y, current_yaw, v, w);
+ traj.cost = compute_trajectory_cost(traj, target_x, target_y, obstacles_map,
+ costmap, width, height, offset_x, offset_y,
+ v, w, prev_v, prev_w);
+ if (traj.cost < best_traj.cost && traj.cost < 10000.0) {
+ best_traj = traj;
+ best_traj.linear_vel = v;
+ best_traj.angular_vel = w;
+ }
+ }
+ }
+
+ return best_traj;
+ }
+
+private:
+ Trajectory simulate_trajectory(double x, double y, double yaw, double v, double w) {
+ Trajectory traj;
+ traj.points.emplace_back(x, y);
+ double t = 0.0;
+
+ for (int i = 0; i < num_steps_; ++i) {
+ t += dt_;
+ x += v * std::cos(yaw) * dt_;
+ y += v * std::sin(yaw) * dt_;
+ yaw += w * dt_;
+ yaw = std::atan2(std::sin(yaw), std::cos(yaw));
+ traj.points.emplace_back(x, y);
+ }
+ traj.final_yaw = yaw;
+ return traj;
+ }
+
+ double compute_trajectory_cost(const Trajectory& traj, double target_x, double target_y,
+    const std::vector<std::pair<double, double>>& obstacles_map,
+    const std::vector<double>& costmap, int width, int /*height*/,
+    double offset_x, double offset_y,
+    double v, double w, double prev_v, double prev_w){
+
+    double obs_cost = 0.0;
+    double close_cost = 0.0;
+
+    double min_dist = std::numeric_limits<double>::max();
+    // [FIX 14] Distance minimale AU BUT le long de toute la trajectoire, pas
+    // seulement au dernier point : avec un horizon simulé de plusieurs
+    // secondes, une trajectoire qui passe près du but puis continue au-delà
+    // ne doit pas être pénalisée comme si elle s'en éloignait. Ça évite les
+    // choix de vitesse qui changent d'une frame à l'autre juste parce que
+    // l'horizon dépasse la distance restante (cause du "bizarre" en fin de
+    // trajectoire).
+    double min_dist_to_target = std::numeric_limits<double>::max();
+
+    for (const auto& [x, y] : traj.points) {
+        for (const auto& [ox, oy] : obstacles_map) {
+            double dist = std::hypot(ox - x, oy - y);
+            min_dist = std::min(min_dist, dist);
+
+            if (dist < safety_buffer_ * 1.2) {
+                close_cost += 5000.0 / (dist + 0.01);
+            }
+        }
+
+        int idx = coords_to_index(x, y, width, resolution_, offset_x, offset_y);
+        if (idx >= 0 && idx < static_cast<int>(costmap.size())) {
+            if (costmap[idx] >= 10.0) {
+                obs_cost += 10000.0;
+            } else if (costmap[idx] >= 5.0) {
+                obs_cost += 2000.0 / (costmap[idx] + 1.0);
+            }
+        }
+
+        min_dist_to_target = std::min(min_dist_to_target, std::hypot(x - target_x, y - target_y));
+    }
+
+    double goal_cost = min_dist_to_target;
+
+    // Alignement de cap en fin de trajectoire vers le but : réduit les
+    // hésitations quand plusieurs (v,w) donnent un goal_cost similaire.
+    auto& last_point = traj.points.back();
+    double desired_final_yaw = std::atan2(target_y - last_point.second, target_x - last_point.first);
+    double yaw_err = std::atan2(std::sin(traj.final_yaw - desired_final_yaw), std::cos(traj.final_yaw - desired_final_yaw));
+    double heading_cost = std::abs(yaw_err);
+
+    // Lissage de vitesse : pénalise les grands sauts par rapport à la
+    // commande précédente, pour éviter le "chattering" entre deux (v,w) de
+    // coût quasi identique d'un cycle de contrôle à l'autre.
+    double smoothing_cost = std::abs(v - prev_v) + std::abs(w - prev_w);
+
+    return 0.4 * goal_cost + 1.8 * obs_cost + 2.2 * close_cost
+         + heading_alignment_weight_ * heading_cost
+         + velocity_smoothing_weight_ * smoothing_cost;
+}
+
+ double max_linear_vel_, max_angular_vel_;
+ double resolution_, local_window_size_, dt_, safety_buffer_;
+ int num_steps_;
+ double v_step_, w_step_;
+ double heading_slowdown_min_factor_;
+ double max_linear_decel_;
+ double velocity_smoothing_weight_;
+ double heading_alignment_weight_;
+};
+
+
+class RRTStarNavNode : public rclcpp::Node {
+public:
+ RRTStarNavNode() : Node("prm_nav_node") {
+ // --- Map / costmap ---
+ declare_parameter("map_width", 400);
+ declare_parameter("map_height", 400);
+ declare_parameter("resolution", 0.05);
+
+ // --- Géométrie robot : remplace l'ancien "inflation_radius" ---
+ // inflation_radius_ est maintenant DÉRIVÉ de ces deux valeurs, cf. FIX 10.
+ declare_parameter("robot_radius", 0.3);
+ declare_parameter("inflation_margin", 0.2);
+
+ // --- Robot dynamics (SET THESE FOR PGUARD, see README) ---
+ declare_parameter("max_linear_vel", 0.4);
+ declare_parameter("max_angular_vel", 1.0);
+ declare_parameter("lookahead_dist", 1.0);
+ declare_parameter("local_window_size", 2.5);
+ declare_parameter("local_plan_dt", 0.1);
+ declare_parameter("local_plan_steps", 30);
+ declare_parameter("safety_buffer", 0.65);
+ // --- Fin d'approche / anti-spin près du goal (cf. FIX 13) ---
+ declare_parameter("goal_tolerance", 0.12);
+ declare_parameter("waypoint_reached_radius", 0.25);
+ declare_parameter("goal_approach_dist", 0.6);
+ declare_parameter("turn_in_place_min_dist", 0.5);
+ declare_parameter("heading_slowdown_min_factor", 0.15);
+ // --- DWA search resolution / perf (tune if control loop lags) ---
+ declare_parameter("dwa_v_step", 0.05);
+ declare_parameter("dwa_w_step", 0.1);
+ declare_parameter("scan_stride", 3);
+ // --- RRT* (remplace prm_solve_time) ---
+ declare_parameter("planner_solve_time", 2.0);
+ declare_parameter("planner_occ_threshold", 5.0);
+ declare_parameter("rrt_range", 0.0);       // 0.0 = laisser OMPL choisir
+ declare_parameter("rrt_goal_bias", 0.05);
+ // --- Frames (doivent correspondre à mapping.launch.py / slam_toolbox) ---
+ declare_parameter("map_frame", "map");
+ declare_parameter("base_frame", "base_link");
+ declare_parameter("max_linear_decel", 0.5);
+ declare_parameter("velocity_smoothing_weight", 1.5);
+ declare_parameter("heading_alignment_weight", 1.0);
+
+ width_ = get_parameter("map_width").as_int();
+ height_ = get_parameter("map_height").as_int();
+ resolution_ = get_parameter("resolution").as_double();
+
+ robot_radius_ = get_parameter("robot_radius").as_double();
+ inflation_margin_ = get_parameter("inflation_margin").as_double();
+ inflation_radius_ = 3.0 * (robot_radius_ + inflation_margin_);
+
+ max_linear_vel_ = get_parameter("max_linear_vel").as_double();
+ max_angular_vel_ = get_parameter("max_angular_vel").as_double();
+ lookahead_dist_ = get_parameter("lookahead_dist").as_double();
+ local_window_size_ = get_parameter("local_window_size").as_double();
+ local_plan_dt_ = get_parameter("local_plan_dt").as_double();
+ local_plan_steps_ = get_parameter("local_plan_steps").as_int();
+ safety_buffer_ = get_parameter("safety_buffer").as_double();
+ goal_tolerance_ = get_parameter("goal_tolerance").as_double();
+ waypoint_reached_radius_ = get_parameter("waypoint_reached_radius").as_double();
+ goal_approach_dist_ = get_parameter("goal_approach_dist").as_double();
+ turn_in_place_min_dist_ = get_parameter("turn_in_place_min_dist").as_double();
+ planner_solve_time_ = get_parameter("planner_solve_time").as_double();
+ planner_occ_threshold_ = get_parameter("planner_occ_threshold").as_double();
+ rrt_range_ = get_parameter("rrt_range").as_double();
+ rrt_goal_bias_ = get_parameter("rrt_goal_bias").as_double();
+ map_frame_ = get_parameter("map_frame").as_string();
+ base_frame_ = get_parameter("base_frame").as_string();
+
+// ... publishers ...
+
+ local_window_pub_ = create_publisher<visualization_msgs::msg::Marker>("local_window", 10);
+
+  double heading_slowdown_min_factor = get_parameter("heading_slowdown_min_factor").as_double();
+  double dwa_v_step = get_parameter("dwa_v_step").as_double();
+  double dwa_w_step = get_parameter("dwa_w_step").as_double();
+  double max_linear_decel = get_parameter("max_linear_decel").as_double();
+  double velocity_smoothing_weight = get_parameter("velocity_smoothing_weight").as_double();
+  double heading_alignment_weight = get_parameter("heading_alignment_weight").as_double();
+
+  local_planner_ = std::make_unique<LocalPlanner>(
+      local_plan_dt_, local_plan_steps_, safety_buffer_,
+      dwa_v_step, dwa_w_step, heading_slowdown_min_factor,
+      max_linear_decel, velocity_smoothing_weight, heading_alignment_weight);
+ robot_footprint_pub_ = create_publisher<visualization_msgs::msg::Marker>("robot_footprint", 10);
+ goal_arrow_pub_ = create_publisher<visualization_msgs::msg::Marker>("goal_arrow", 10);
+ path_arrow_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("path_arrows", 10);
+ lookahead_pub_ = create_publisher<visualization_msgs::msg::Marker>("lookahead_circle", 10);
+ status_text_pub_ = create_publisher<visualization_msgs::msg::Marker>("nav_status_text", 10);
+
+double heading_slowdown_min_factor = get_parameter("heading_slowdown_min_factor").as_double();
+double dwa_v_step = get_parameter("dwa_v_step").as_double();
+double dwa_w_step = get_parameter("dwa_w_step").as_double();
+double max_linear_decel = get_parameter("max_linear_decel").as_double();
+double velocity_smoothing_weight = get_parameter("velocity_smoothing_weight").as_double();
+    local_plan_dt_, local_plan_steps_, safety_buffer_,
+    dwa_v_step, dwa_w_step, heading_slowdown_min_factor,
+    max_linear_decel, velocity_smoothing_weight, heading_alignment_weight);
+
+
+
+ path_pub_ = create_publisher<nav_msgs::msg::Path>("prm_path", 10);
+ local_path_pub_ = create_publisher<nav_msgs::msg::Path>("local_path", 10);
+ start_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("start_pose", 10);
+ goal_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("goal_pose", 10);
+ cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
+
+ odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+ "/odom", 10, std::bind(&RRTStarNavNode::odom_callback, this, std::placeholders::_1));
+
+ // QoS best_effort/volatile : pointcloud_to_laserscan_node publie /scan avec
+ // une QoS de type "sensor data" (best_effort). Un abonnement reliable par
+ // défaut peut ne recevoir aucun message si l'éditeur est best_effort.
+ auto scan_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
+ scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
+ "/scan", scan_qos, std::bind(&RRTStarNavNode::scan_callback, this, std::placeholders::_1));
+
+ goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+ "/move_base_simple/goal", 10, std::bind(&RRTStarNavNode::goal_callback, this, std::placeholders::_1));
+ costmap_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>("prm_costmap", 10);
+ waypoints_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("prm_waypoints", 10);
+ dynamic_obs_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("dynamic_obstacles", 10);
+
+ tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+ tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+ timer_ = create_wall_timer(
+ std::chrono::milliseconds(500),
+ [this]() {
+ if (odom_received_ && goal_received_ && path_indices_.empty()) {
+ execute_planner();
+ timer_->cancel();
+ }
+ });
+
+ visualization_timer_ = create_wall_timer(
+ std::chrono::milliseconds(100),
+ [this]() { publish_visualizations(); });
+
+ control_timer_ = create_wall_timer(
+ std::chrono::milliseconds(50),
+ [this]() {
+ if (odom_received_ && goal_received_) {
+ if (path_indices_.empty() || (costmap_changed_ && !is_path_valid())) {
+ execute_planner();
+ }
+ follow_path();
+ }
+ });
+
+ update_path_timer_ = create_wall_timer(
+ std::chrono::milliseconds(4000),
+ [this]() {
+ if (odom_received_ && goal_received_ && !path_indices_.empty()) {
+ update_path_if_better();
+ }
+ });
+
+ costmap_.resize(width_ * height_, 1.0);
+ RCLCPP_INFO(get_logger(),
+ "RRTStarNavNode initialized with map %dx%d, resolution=%f, robot_radius=%f, "
+ "inflation_margin=%f (-> inflation_radius=%f), planner_solve_time=%f "
+ "(map_frame='%s', base_frame='%s')",
+ width_, height_, resolution_, robot_radius_, inflation_margin_, inflation_radius_,
+ planner_solve_time_, map_frame_.c_str(), base_frame_.c_str());
+ }
+
+private:
+ bool is_path_valid() {
+ for (int idx : path_indices_) {
+ if (idx < 0 || idx >= static_cast<int>(costmap_.size()) || costmap_[idx] >= 10.0) {
+ RCLCPP_WARN(get_logger(), "Path invalid at node %d (cost=%f)", idx, costmap_[idx]);
+ return false;
+ }
+ }
+ return true;
+ }
+
+ void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+ geometry_msgs::msg::PoseStamped odom_pose;
+ odom_pose.header = msg->header;
+ odom_pose.pose = msg->pose.pose;
+
+ geometry_msgs::msg::PoseStamped map_pose;
+ try {
+ tf_buffer_->transform(odom_pose, map_pose, map_frame_, tf2::durationFromSec(2.0));
+ } catch (const tf2::TransformException& ex) {
+ RCLCPP_WARN(get_logger(), "Transform failed: %s", ex.what());
+ return;
+ }
+
+ current_x_ = map_pose.pose.position.x;
+ current_y_ = map_pose.pose.position.y;
+
+ tf2::Quaternion q(
+ map_pose.pose.orientation.x,
+ map_pose.pose.orientation.y,
+ map_pose.pose.orientation.z,
+ map_pose.pose.orientation.w);
+ tf2::Matrix3x3 m(q);
+ double roll, pitch;
+ m.getRPY(roll, pitch, current_yaw_);
+ current_yaw_ = std::atan2(std::sin(current_yaw_), std::cos(current_yaw_));
+
+ if (!odom_received_) {
+ start_x_ = current_x_;
+ start_y_ = current_y_;
+ offset_x_ = start_x_ - (width_ * resolution_ / 2.0);
+ offset_y_ = start_y_ - (height_ * resolution_ / 2.0);
+ odom_received_ = true;
+ RCLCPP_INFO(get_logger(), "Initial position set in %s: x=%f, y=%f", map_frame_.c_str(), start_x_, start_y_);
+ }
+ }
+
+ void goal_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+ if (!odom_received_) {
+ RCLCPP_WARN(get_logger(), "Goal rejected: no odometry received yet, cannot validate goal position.");
+ return;
+ }
+ if (msg->header.frame_id != map_frame_) {
+ RCLCPP_WARN(get_logger(), "Goal received in invalid frame: %s, expected: %s",
+ msg->header.frame_id.c_str(), map_frame_.c_str());
+ return;
+ }
+
+ double new_goal_x = msg->pose.position.x;
+ double new_goal_y = msg->pose.position.y;
+
+ if (goal_received_) {
+ double dist_to_current_goal = std::sqrt(std::pow(new_goal_x - goal_x_, 2) + std::pow(new_goal_y - goal_y_, 2));
+ if (dist_to_current_goal < 0.05) {
+ RCLCPP_DEBUG(get_logger(), "Ignoring duplicate goal (%.3f m from current goal)", dist_to_current_goal);
+ return;
+ }
+ }
+
+ int goal_index = coords_to_index(new_goal_x, new_goal_y, width_, resolution_, offset_x_, offset_y_);
+ if (goal_index >= 0 && goal_index < static_cast<int>(costmap_.size()) && costmap_[goal_index] < 15.0) {
+ goal_x_ = new_goal_x;
+ goal_y_ = new_goal_y;
+ goal_received_ = true;
+ path_indices_.clear();
+ current_path_length_ = std::numeric_limits<double>::max();
+ costmap_changed_ = true;
+ RCLCPP_INFO(get_logger(), "New goal received in %s: x=%f, y=%f", map_frame_.c_str(), goal_x_, goal_y_);
+ } else {
+ RCLCPP_WARN(get_logger(), "Goal at (%f, %f) invalid: in obstacle or out of the %dx%d map window "
+ "(check map_width/map_height/resolution params)",
+ new_goal_x, new_goal_y, width_, height_);
+ }
+ }
+
+ void inflate_obstacle(int obs_idx) {
+ int obs_x = obs_idx % width_;
+ int obs_y = obs_idx / width_;
+ int inflation_cells = static_cast<int>(inflation_radius_ / resolution_);
+
+ for (int dx = -inflation_cells; dx <= inflation_cells; ++dx) {
+ for (int dy = -inflation_cells; dy <= inflation_cells; ++dy) {
+ int new_x = obs_x + dx;
+ int new_y = obs_y + dy;
+ if (new_x >= 0 && new_x < width_ && new_y >= 0 && new_y < height_) {
+ int idx = new_y * width_ + new_x;
+ double distance = resolution_ * std::sqrt(dx * dx + dy * dy);
+ if (distance <= inflation_radius_ && costmap_[idx] < 100.0) {
+ double cost = 15.0 * (1.0 - distance / inflation_radius_);
+ costmap_[idx] = std::max(costmap_[idx], std::max(1.0, cost));
+ }
+ }
+ }
+ }
+ }
+
+ void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+ bool significant_change = false;
+
+ if (!warned_frame_mismatch_ && msg->header.frame_id != base_frame_) {
+ RCLCPP_WARN(get_logger(),
+ "Scan frame '%s' != configured base_frame '%s'. Ce n'est pas bloquant "
+ "(le TF vers map_frame_ est utilisé pour la projection), mais vérifiez "
+ "target_frame dans pointcloud_to_laserscan si le comportement semble faux.",
+ msg->header.frame_id.c_str(), base_frame_.c_str());
+ warned_frame_mismatch_ = true;
+ }
+
+ geometry_msgs::msg::TransformStamped transform;
+ try {
+ transform = tf_buffer_->lookupTransform(map_frame_, msg->header.frame_id, msg->header.stamp, tf2::durationFromSec(0.5));
+ } catch (const tf2::TransformException& ex) {
+ RCLCPP_WARN(get_logger(), "Failed to get transform from %s to %s: %s",
+ msg->header.frame_id.c_str(), map_frame_.c_str(), ex.what());
+ return;
+ }
+
+ for (size_t i = 0; i < msg->ranges.size(); ++i) {
+ double range = msg->ranges[i];
+ if (range < msg->range_max && range > msg->range_min) {
+ double angle = msg->angle_min + i * msg->angle_increment;
+
+ geometry_msgs::msg::Point laser_point;
+ laser_point.x = range * std::cos(angle);
+ laser_point.y = range * std::sin(angle);
+ laser_point.z = 0.0;
+
+ geometry_msgs::msg::Point map_point;
+ tf2::doTransform(laser_point, map_point, transform);
+
+ int obs_idx = coords_to_index(map_point.x, map_point.y, width_, resolution_, offset_x_, offset_y_);
+ if (obs_idx >= 0 && obs_idx < static_cast<int>(costmap_.size()) && costmap_[obs_idx] < 100.0) {
+ costmap_[obs_idx] = 100.0;
+ inflate_obstacle(obs_idx);
+ significant_change = true;
+ }
+ }
+ }
+
+ dynamic_obstacles_.clear();
+ dynamic_obstacles_.reserve(msg->ranges.size() / scan_stride_ + 1);
+ for (size_t i = 0; i < msg->ranges.size(); i += scan_stride_) {
+ double range = msg->ranges[i];
+ if (range < msg->range_max && range > msg->range_min) {
+ double angle = msg->angle_min + i * msg->angle_increment;
+ geometry_msgs::msg::Point laser_point;
+ laser_point.x = range * std::cos(angle);
+ laser_point.y = range * std::sin(angle);
+ laser_point.z = 0.0;
+ geometry_msgs::msg::Point map_point;
+ tf2::doTransform(laser_point, map_point, transform);
+ dynamic_obstacles_.emplace_back(map_point.x, map_point.y);
+ }
+ }
+
+ if (significant_change) {
+ costmap_changed_ = true;
+ }
+ }
+
+ void execute_planner() {
+ RCLCPP_INFO(get_logger(), "Starting RRT* execution...");
+ if (!odom_received_) {
+ RCLCPP_WARN(get_logger(), "Odometry data not received!");
+ return;
+ }
+ if (!goal_received_) {
+ RCLCPP_WARN(get_logger(), "No valid goal received!");
+ return;
+ }
+
+ path_indices_.clear();
+ current_waypoint_idx_ = 0;
+ GridViz grid_viz;
+ offset_x_ = start_x_ - (width_ * resolution_ / 2.0);
+ offset_y_ = start_y_ - (height_ * resolution_ / 2.0);
+
+ int start_index = coords_to_index(current_x_, current_y_, width_, resolution_, offset_x_, offset_y_);
+ int goal_index = coords_to_index(goal_x_, goal_y_, width_, resolution_, offset_x_, offset_y_);
+
+ RCLCPP_INFO(get_logger(), "Start: x=%f, y=%f, index=%d", current_x_, current_y_, start_index);
+ RCLCPP_INFO(get_logger(), "Goal: x=%f, y=%f, index=%d", goal_x_, goal_y_, goal_index);
+
+ if (start_index < 0 || start_index >= width_ * height_) {
+ RCLCPP_ERROR(get_logger(), "Start index %d out of bounds (map size=%d)! "
+ "Increase map_width/map_height/resolution.", start_index, width_ * height_);
+ return;
+ }
+ if (goal_index < 0 || goal_index >= width_ * height_) {
+ RCLCPP_ERROR(get_logger(), "Goal index %d out of bounds (map size=%d)! "
+ "Increase map_width/map_height/resolution.", goal_index, width_ * height_);
+ return;
+ }
+
+ if (costmap_[start_index] >= 20.0) {
+ RCLCPP_WARN(get_logger(), "Start in obstacle area (cost=%f)!", costmap_[start_index]);
+ return;
+ }
+ if (costmap_[goal_index] >= 15.0) {
+ RCLCPP_WARN(get_logger(), "Goal in obstacle area (cost=%f)!", costmap_[goal_index]);
+ return;
+ }
+
+ path_indices_ = smooth_path(
+ rrt_star_plan(start_index, goal_index, width_, height_, costmap_, resolution_, grid_viz,
+               offset_x_, offset_y_, planner_solve_time_, planner_occ_threshold_,
+               rrt_range_, rrt_goal_bias_),
+ width_, height_, resolution_, offset_x_, offset_y_, costmap_);
+ costmap_changed_ = false;
+
+ current_path_length_ = compute_path_length(path_indices_, width_, resolution_, offset_x_, offset_y_);
+ RCLCPP_INFO(get_logger(), "RRT* returned a path with %zu points, length=%f m",
+ path_indices_.size(), current_path_length_);
+ if (path_indices_.empty()) {
+ RCLCPP_WARN(get_logger(), "No valid path found! Retrying...");
+ current_path_length_ = std::numeric_limits<double>::max();
+ }
+ }
+
+ void update_path_if_better() {
+ double goal_distance = std::sqrt(std::pow(current_x_ - goal_x_, 2) + std::pow(current_y_ - goal_y_, 2));
+ if (goal_distance < 0.3) {
+ RCLCPP_DEBUG(get_logger(), "Too close to goal (%f m), skipping path update", goal_distance);
+ return;
+ }
+
+ GridViz grid_viz;
+ offset_x_ = start_x_ - (width_ * resolution_ / 2.0);
+ offset_y_ = start_y_ - (height_ * resolution_ / 2.0);
+
+ int start_index = coords_to_index(current_x_, current_y_, width_, resolution_, offset_x_, offset_y_);
+ int goal_index = coords_to_index(goal_x_, goal_y_, width_, resolution_, offset_x_, offset_y_);
+
+ if (start_index < 0 || start_index >= width_ * height_ || costmap_[start_index] >= 10.0) {
+ RCLCPP_DEBUG(get_logger(), "Invalid current position for path recalculation");
+ return;
+ }
+ if (goal_index < 0 || goal_index >= width_ * height_ || costmap_[goal_index] >= 10.0) {
+ RCLCPP_DEBUG(get_logger(), "Invalid goal for path recalculation");
+ return;
+ }
+
+ std::vector<int> new_path = smooth_path(
+ rrt_star_plan(start_index, goal_index, width_, height_, costmap_, resolution_, grid_viz,
+               offset_x_, offset_y_, planner_solve_time_, planner_occ_threshold_,
+               rrt_range_, rrt_goal_bias_),
+ width_, height_, resolution_, offset_x_, offset_y_, costmap_);
+
+ if (new_path.empty()) {
+ RCLCPP_DEBUG(get_logger(), "New path empty, keeping current path");
+ return;
+ }
+
+ double new_path_length = compute_path_length(new_path, width_, resolution_, offset_x_, offset_y_);
+ if (new_path_length < current_path_length_ * 0.9) {
+ RCLCPP_INFO(get_logger(), "Better path found: old length=%f m, new length=%f m",
+ current_path_length_, new_path_length);
+ path_indices_ = new_path;
+ current_path_length_ = new_path_length;
+ current_waypoint_idx_ = 0;
+ costmap_changed_ = false;
+ } else {
+ RCLCPP_DEBUG(get_logger(), "New path not better: length=%f m vs current=%f m",
+ new_path_length, current_path_length_);
+ }
+ }
+
+ void publish_visualizations() {
+ rclcpp::Time now = get_clock()->now();
+
+ geometry_msgs::msg::PoseStamped start_pose;
+ start_pose.header.stamp = now;
+ start_pose.header.frame_id = map_frame_;
+ start_pose.pose.position.x = start_x_;
+ start_pose.pose.position.y = start_y_;
+ start_pose.pose.position.z = 0.0;
+ start_pose.pose.orientation.w = 1.0;
+ start_pose_pub_->publish(start_pose);
+
+ if (goal_received_) {
+ geometry_msgs::msg::PoseStamped goal_pose;
+ goal_pose.header.stamp = now;
+ goal_pose.header.frame_id = map_frame_;
+ goal_pose.pose.position.x = goal_x_;
+ goal_pose.pose.position.y = goal_y_;
+ goal_pose.pose.position.z = 0.0;
+ goal_pose.pose.orientation.w = 1.0;
+ goal_pose_pub_->publish(goal_pose);
+ }
+
+ if (!path_indices_.empty()) {
+ nav_msgs::msg::Path path_msg;
+ path_msg.header.stamp = now;
+ path_msg.header.frame_id = map_frame_;
+ for (int index : path_indices_) {
+ geometry_msgs::msg::PoseStamped pose;
+ pose.header = path_msg.header;
+ pose.pose.position.x = (index % width_) * resolution_ + offset_x_;
+ pose.pose.position.y = (index / width_) * resolution_ + offset_y_;
+ pose.pose.position.z = 0.0;
+ pose.pose.orientation.w = 1.0;
+ path_msg.poses.push_back(pose);
+ }
+ path_pub_->publish(path_msg);
+ }
+
+ if (!local_path_.points.empty()) {
+ nav_msgs::msg::Path local_path_msg;
+ local_path_msg.header.stamp = now;
+ local_path_msg.header.frame_id = map_frame_;
+ for (const auto& [x, y] : local_path_.points) {
+ geometry_msgs::msg::PoseStamped pose;
+ pose.header = local_path_msg.header;
+ pose.pose.position.x = x;
+ pose.pose.position.y = y;
+ pose.pose.position.z = 0.0;
+ pose.pose.orientation.w = 1.0;
+ local_path_msg.poses.push_back(pose);
+ }
+ local_path_pub_->publish(local_path_msg);
+ }
+
+ publish_costmap();
+ publish_waypoints_markers();
+ publish_dynamic_obstacles_markers();
+ publish_local_window();
+ publish_robot_footprint();
+ publish_goal_arrow();
+ publish_path_arrows();
+ publish_lookahead_circle();
+ publish_status_text();
+ }
+
+ void follow_path() {
+    if (!odom_received_) {
+        RCLCPP_WARN(get_logger(), "No odometry data, cannot follow path");
+        return;
+    }
+    if (!goal_received_) {
+        RCLCPP_WARN(get_logger(), "No valid goal, cannot follow path");
+        return;
+    }
+    if (path_indices_.empty()) {
+        RCLCPP_WARN(get_logger(), "Empty path, waiting for planning");
+        geometry_msgs::msg::Twist stop_cmd;
+        cmd_vel_pub_->publish(stop_cmd);
+        return;
+    }
+
+    // =============================================
+    // 1. VÉRIFICATION GOAL ATTEINT (priorité absolue)
+    // =============================================
+    double goal_distance = std::hypot(current_x_ - goal_x_, current_y_ - goal_y_);
+    if (goal_distance < goal_tolerance_) {
+        geometry_msgs::msg::Twist stop_cmd;
+        cmd_vel_pub_->publish(stop_cmd);
+        RCLCPP_INFO(get_logger(), "Goal reached at (%.2f, %.2f) - distance=%.3f m",
+                    goal_x_, goal_y_, goal_distance);
+
+        goal_received_ = false;
+        path_indices_.clear();
+        current_waypoint_idx_ = 0;
+        current_path_length_ = std::numeric_limits<double>::max();
+        is_turning_ = false;
+        return;
+    }
+
+    // =============================================
+    // 2. Replanning si nécessaire
+    // =============================================
+    if (path_indices_.empty() || (costmap_changed_ && !is_path_valid())) {
+        static rclcpp::Time last_plan_time = get_clock()->now();
+        if ((get_clock()->now() - last_plan_time).seconds() > 1.5) {
+            RCLCPP_INFO(get_logger(), "Triggering RRT* replanning (invalid path)");
+            execute_planner();
+            last_plan_time = get_clock()->now();
+        }
+    }
+
+    // =============================================
+    // 3. Sélection du waypoint courant
+    // =============================================
+    // [FIX 13] Ancienne logique : on ne mettait à jour current_waypoint_idx_
+    // que si un point strictement PLUS ÉLOIGNÉ que 0.25m était trouvé. Près
+    // du but, quand les points du chemin lissé sont rapprochés, aucun point
+    // ne satisfaisait cette condition -> current_waypoint_idx_ restait
+    // bloqué sur un point déjà dépassé, situé derrière ou à côté du robot.
+    // Le cap désiré calculé plus bas pointait alors n'importe où -> grand
+    // écart d'angle -> déclenchement d'un demi-tour sur place en boucle,
+    // sans jamais faire progresser goal_distance sous le seuil de goal
+    // atteint (d'où le "bug" qui n'affichait jamais "goal reached").
+    //
+    // Nouvelle logique en 2 temps :
+    //  a) on avance current_waypoint_idx_ au-delà de tous les points déjà
+    //     atteints (distance < waypoint_reached_radius_) ;
+    //  b) on avance ensuite jusqu'au point le plus loin encore atteignable
+    //     dans la fenêtre de lookahead (pure-pursuit classique).
+    while (current_waypoint_idx_ < path_indices_.size() - 1) {
+        int idx = path_indices_[current_waypoint_idx_];
+        double x = (idx % width_) * resolution_ + offset_x_;
+        double y = (idx / width_) * resolution_ + offset_y_;
+        double dist = std::hypot(x - current_x_, y - current_y_);
+        if (dist < waypoint_reached_radius_) {
+            current_waypoint_idx_++;
+        } else {
+            break;
+        }
+    }
+    for (size_t i = current_waypoint_idx_; i < path_indices_.size(); ++i) {
+        int idx = path_indices_[i];
+        double x = (idx % width_) * resolution_ + offset_x_;
+        double y = (idx / width_) * resolution_ + offset_y_;
+        double dist = std::hypot(x - current_x_, y - current_y_);
+        if (dist <= lookahead_dist_) {
+            current_waypoint_idx_ = i;
+        } else {
+            break;
+        }
+    }
+
+    int curr_idx = path_indices_[current_waypoint_idx_];
+    double x_curr = (curr_idx % width_) * resolution_ + offset_x_;
+    double y_curr = (curr_idx / width_) * resolution_ + offset_y_;
+    double dist_to_curr = std::hypot(x_curr - current_x_, y_curr - current_y_);
+   
+    // [FIX 13] Approche finale : en dessous de goal_approach_dist_, on vise
+    // directement le but plutôt que le dernier waypoint du chemin global
+    // (qui peut être légèrement décalé par la discrétisation de la grille
+    // et le lissage), ce qui supprime les oscillations de cap juste avant
+    // l'arrivée.
+    if (goal_distance < goal_approach_dist_) {
+        target_x_ = goal_x_;
+        target_y_ = goal_y_;
+        dist_to_curr = goal_distance;
+    } else if (dist_to_curr > local_window_size_) {
+        double theta = std::atan2(y_curr - current_y_, x_curr - current_x_);
+        target_x_ = current_x_ + local_window_size_ * std::cos(theta);
+        target_y_ = current_y_ + local_window_size_ * std::sin(theta);
+    } else {
+        target_x_ = x_curr;
+        target_y_ = y_curr;
+    }
+
+    // Replanification si le prochain waypoint est en collision (le suivi
+    // d'avancement lui-même est géré par la boucle "while" ci-dessus).
+    if (current_waypoint_idx_ < path_indices_.size() - 1) {
+        int next_idx = path_indices_[current_waypoint_idx_ + 1];
+        if (!is_collision_free(next_idx, costmap_, width_, height_)) {
+            RCLCPP_WARN(get_logger(), "Next waypoint in collision - replanning");
+            costmap_changed_ = true;
+        }
+    }
+
+    // =============================================
+    // 4. Gestion du demi-tour
+    // =============================================
+    double desired_yaw = std::atan2(target_y_ - current_y_, target_x_ - current_x_);
+    double yaw_diff = std::atan2(std::sin(desired_yaw - current_yaw_),
+                                 std::cos(desired_yaw - current_yaw_));
+
+    const double turn_threshold = M_PI * 0.75;
+
+    // [FIX 13] Un demi-tour sur place n'a de sens que loin du but : juste
+    // avant l'arrivée, avec la cible = but direct, un léger bruit de
+    // position/orientation pouvait faire dépasser turn_threshold et
+    // déclencher un tour complet inutile à quelques centimètres du goal.
+    if (!is_turning_ && std::abs(yaw_diff) > turn_threshold && dist_to_curr > 0.3
+        && goal_distance > turn_in_place_min_dist_) {
+        is_turning_ = true;
+        turn_start_time_ = get_clock()->now();
+        RCLCPP_INFO(get_logger(), "Initiating turn (yaw_diff=%.2f rad)", yaw_diff);
+    }
+
+    if (is_turning_) {
+        geometry_msgs::msg::Twist turn_cmd;
+        // [FIX] Respecte enfin max_angular_vel_ au lieu d'une valeur fixe
+        // (0.75 rad/s) qui pouvait être plus rapide OU plus lente que ce
+        // que le robot est réellement capable/autorisé à faire.
+        turn_cmd.angular.z = (yaw_diff > 0 ? 1.0 : -1.0) * max_angular_vel_;
+        cmd_vel_pub_->publish(turn_cmd);
+
+        yaw_diff = std::atan2(std::sin(desired_yaw - current_yaw_),
+                              std::cos(desired_yaw - current_yaw_));
+
+        if (std::abs(yaw_diff) < 0.25 ||
+            (get_clock()->now() - turn_start_time_).seconds() > 4.0) {
+            is_turning_ = false;
+            RCLCPP_INFO(get_logger(), "Turn completed");
+        }
+        return;
+    }
+
+    // =============================================
+    // 5. DWA Local Planner
+    // =============================================
+    // Replace the current call (lines 1254-1258)
+    auto local_traj = local_planner_->compute_best_trajectory(
+        current_x_, current_y_, current_yaw_,
+        target_x_, target_y_,
+        costmap_, width_, height_, offset_x_, offset_y_,
+        dynamic_obstacles_,
+        prev_v_, prev_w_);   // added the last two
+
+    local_path_ = local_traj;
+
+    geometry_msgs::msg::Twist cmd;
+    cmd.linear.x = local_traj.linear_vel;
+    cmd.angular.z = local_traj.angular_vel;
+    cmd_vel_pub_->publish(cmd);
+    prev_v_ = local_traj.linear_vel;
+    prev_w_ = local_traj.angular_vel;
+}
+ void publish_dynamic_obstacles_markers() {
+ visualization_msgs::msg::MarkerArray marker_array;
+ rclcpp::Time now = get_clock()->now();
+
+ visualization_msgs::msg::Marker delete_marker;
+ delete_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+ marker_array.markers.push_back(delete_marker);
+
+ int id = 0;
+ for (const auto& [ox, oy] : dynamic_obstacles_) {
+ visualization_msgs::msg::Marker m;
+ m.header.frame_id = map_frame_;
+ m.header.stamp = now;
+ m.ns = "dynamic_obstacles";
+ m.id = id++;
+ m.type = visualization_msgs::msg::Marker::CYLINDER;
+ m.action = visualization_msgs::msg::Marker::ADD;
+ m.pose.position.x = ox;
+ m.pose.position.y = oy;
+ m.pose.position.z = 0.1;
+ m.pose.orientation.w = 1.0;
+ m.scale.x = m.scale.y = safety_buffer_ * 0.15;
+ m.scale.z = 0.2;
+ m.color.r = 1.0; m.color.g = 0.3; m.color.b = 0.0; m.color.a = 0.6;
+ m.lifetime = rclcpp::Duration::from_seconds(0.5);
+ marker_array.markers.push_back(m);
+ }
+ dynamic_obs_pub_->publish(marker_array);
+ }
+
+ void publish_waypoints_markers() {
+ visualization_msgs::msg::MarkerArray marker_array;
+ rclcpp::Time now = get_clock()->now();
+
+ visualization_msgs::msg::Marker delete_marker;
+ delete_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+ marker_array.markers.push_back(delete_marker);
+
+ for (size_t i = 0; i < path_indices_.size(); ++i) {
+ int idx = path_indices_[i];
+ double x = (idx % width_) * resolution_ + offset_x_;
+ double y = (idx / width_) * resolution_ + offset_y_;
+
+ visualization_msgs::msg::Marker m;
+ m.header.frame_id = map_frame_;
+ m.header.stamp = now;
+ m.ns = "waypoints";
+ m.id = static_cast<int>(i);
+ m.type = visualization_msgs::msg::Marker::SPHERE;
+ m.action = visualization_msgs::msg::Marker::ADD;
+ m.pose.position.x = x;
+ m.pose.position.y = y;
+ m.pose.position.z = 0.05;
+ m.pose.orientation.w = 1.0;
+ m.scale.x = m.scale.y = m.scale.z = 0.08;
+ m.lifetime = rclcpp::Duration::from_seconds(1.0);
+
+ if (i == 0) {
+ m.color.r = 0.0; m.color.g = 1.0; m.color.b = 0.0; m.color.a = 1.0;
+ } else if (i == path_indices_.size() - 1) {
+ m.color.r = 1.0; m.color.g = 0.0; m.color.b = 0.0; m.color.a = 1.0;
+ } else if (i == current_waypoint_idx_) {
+ m.color.r = 0.0; m.color.g = 1.0; m.color.b = 1.0; m.color.a = 1.0;
+ m.scale.x = m.scale.y = m.scale.z = 0.15;
+ } else {
+ m.color.r = 1.0; m.color.g = 1.0; m.color.b = 0.0; m.color.a = 0.8;
+ }
+ marker_array.markers.push_back(m);
+ }
+ waypoints_pub_->publish(marker_array);
+ }
+
+ void publish_costmap() {
+ nav_msgs::msg::OccupancyGrid grid;
+ grid.header.stamp = get_clock()->now();
+ grid.header.frame_id = map_frame_;
+
+ grid.info.resolution = resolution_;
+ grid.info.width = width_;
+ grid.info.height = height_;
+ grid.info.origin.position.x = offset_x_;
+ grid.info.origin.position.y = offset_y_;
+ grid.info.origin.position.z = 0.0;
+ grid.info.origin.orientation.w = 1.0;
+
+ grid.data.resize(width_ * height_);
+ for (int i = 0; i < width_ * height_; ++i) {
+ double cost = costmap_[i];
+ if (cost >= 100.0) {
+ grid.data[i] = 100;
+ } else if (cost >= 10.0) {
+ grid.data[i] = 99;
+ } else if (cost >= 1.0) {
+ grid.data[i] = static_cast<int8_t>(cost / 10.0 * 98);
+ } else {
+ grid.data[i] = 0;
+ }
+ }
+ costmap_pub_->publish(grid);
+ }
+
+ void publish_local_window() {
+ visualization_msgs::msg::Marker m;
+ m.header.frame_id = map_frame_;
+ m.header.stamp = get_clock()->now();
+ m.ns = "local_window";
+ m.id = 0;
+ m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+ m.action = visualization_msgs::msg::Marker::ADD;
+
+ double half = local_window_size_ / 2.0;
+ std::vector<std::pair<double,double>> corners = {
+ {current_x_ - half, current_y_ - half},
+ {current_x_ + half, current_y_ - half},
+ {current_x_ + half, current_y_ + half},
+ {current_x_ - half, current_y_ + half},
+ {current_x_ - half, current_y_ - half}
+ };
+ for (auto& [cx, cy] : corners) {
+ geometry_msgs::msg::Point p;
+ p.x = cx; p.y = cy; p.z = 0.05;
+ m.points.push_back(p);
+ }
+
+ m.scale.x = 0.03;
+ m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 1.0f; m.color.a = 0.9f;
+ m.lifetime = rclcpp::Duration::from_seconds(0.2);
+ local_window_pub_->publish(m);
+ }
+
+ void publish_robot_footprint() {
+ visualization_msgs::msg::Marker m;
+ m.header.frame_id = map_frame_;
+ m.header.stamp = get_clock()->now();
+ m.ns = "robot_footprint";
+ m.id = 0;
+ m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+ m.action = visualization_msgs::msg::Marker::ADD;
+
+ const double radius = robot_radius_ + 0.05;
+ const int N = 36;
+ for (int i = 0; i <= N; ++i) {
+ double angle = 2.0 * M_PI * i / N;
+ geometry_msgs::msg::Point p;
+ p.x = current_x_ + radius * std::cos(angle);
+ p.y = current_y_ + radius * std::sin(angle);
+ p.z = 0.02;
+ m.points.push_back(p);
+ }
+ m.scale.x = 0.02;
+ m.color.r = 1.0f; m.color.g = 0.5f; m.color.b = 0.0f; m.color.a = 0.8f;
+ m.lifetime = rclcpp::Duration::from_seconds(0.2);
+ robot_footprint_pub_->publish(m);
+ }
+
+ void publish_goal_arrow() {
+ if (!goal_received_) return;
+ visualization_msgs::msg::Marker m;
+ m.header.frame_id = map_frame_;
+ m.header.stamp = get_clock()->now();
+ m.ns = "goal_arrow";
+ m.id = 0;
+ m.type = visualization_msgs::msg::Marker::ARROW;
+ m.action = visualization_msgs::msg::Marker::ADD;
+
+ geometry_msgs::msg::Point start_pt, end_pt;
+ start_pt.x = current_x_; start_pt.y = current_y_; start_pt.z = 0.1;
+ end_pt.x = goal_x_; end_pt.y = goal_y_; end_pt.z = 0.1;
+ m.points.push_back(start_pt);
+ m.points.push_back(end_pt);
+
+ m.scale.x = 0.04;
+ m.scale.y = 0.10;
+ m.scale.z = 0.12;
+ m.color.r = 0.9f; m.color.g = 0.0f; m.color.b = 0.9f; m.color.a = 0.6f;
+ m.lifetime = rclcpp::Duration::from_seconds(0.5);
+ goal_arrow_pub_->publish(m);
+ }
+
+ void publish_path_arrows() {
+ if (path_indices_.size() < 2) return;
+ visualization_msgs::msg::MarkerArray arr;
+ rclcpp::Time now = get_clock()->now();
+
+ visualization_msgs::msg::Marker del;
+ del.action = visualization_msgs::msg::Marker::DELETEALL;
+ arr.markers.push_back(del);
+
+ size_t step = std::max<size_t>(1, path_indices_.size() / 20);
+ for (size_t i = 0; i + 1 < path_indices_.size(); i += step) {
+ double x1 = (path_indices_[i] % width_) * resolution_ + offset_x_;
+ double y1 = (path_indices_[i] / width_) * resolution_ + offset_y_;
+ double x2 = (path_indices_[i+1] % width_) * resolution_ + offset_x_;
+ double y2 = (path_indices_[i+1] / width_) * resolution_ + offset_y_;
+
+ visualization_msgs::msg::Marker m;
+ m.header.frame_id = map_frame_;
+ m.header.stamp = now;
+ m.ns = "path_arrows";
+ m.id = static_cast<int>(i);
+ m.type = visualization_msgs::msg::Marker::ARROW;
+ m.action = visualization_msgs::msg::Marker::ADD;
+
+ geometry_msgs::msg::Point p1, p2;
+ p1.x = x1; p1.y = y1; p1.z = 0.04;
+ p2.x = x2; p2.y = y2; p2.z = 0.04;
+ m.points.push_back(p1);
+ m.points.push_back(p2);
+
+ m.scale.x = 0.025; m.scale.y = 0.06; m.scale.z = 0.07;
+
+ double t = static_cast<double>(i) / path_indices_.size();
+ m.color.r = static_cast<float>(t);
+ m.color.g = static_cast<float>(1.0 - t * 0.5);
+ m.color.b = 0.0f;
+ m.color.a = 0.85f;
+ m.lifetime = rclcpp::Duration::from_seconds(1.0);
+ arr.markers.push_back(m);
+ }
+ path_arrow_pub_->publish(arr);
+ }
+
+ void publish_lookahead_circle() {
+ visualization_msgs::msg::Marker m;
+ m.header.frame_id = map_frame_;
+ m.header.stamp = get_clock()->now();
+ m.ns = "lookahead";
+ m.id = 0;
+ m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+ m.action = visualization_msgs::msg::Marker::ADD;
+
+ const int N = 48;
+ for (int i = 0; i <= N; ++i) {
+ double angle = 2.0 * M_PI * i / N;
+ geometry_msgs::msg::Point p;
+ p.x = current_x_ + lookahead_dist_ * std::cos(angle);
+ p.y = current_y_ + lookahead_dist_ * std::sin(angle);
+ p.z = 0.03;
+ m.points.push_back(p);
+ }
+ m.scale.x = 0.015;
+ m.color.r = 1.0f; m.color.g = 1.0f; m.color.b = 1.0f; m.color.a = 0.5f;
+ m.lifetime = rclcpp::Duration::from_seconds(0.2);
+ lookahead_pub_->publish(m);
+ }
+
+ void publish_status_text() {
+ visualization_msgs::msg::Marker m;
+ m.header.frame_id = map_frame_;
+ m.header.stamp = get_clock()->now();
+ m.ns = "status_text";
+ m.id = 0;
+ m.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+ m.action = visualization_msgs::msg::Marker::ADD;
+
+ m.pose.position.x = current_x_;
+ m.pose.position.y = current_y_;
+ m.pose.position.z = 0.5;
+ m.pose.orientation.w = 1.0;
+ m.scale.z = 0.15;
+
+ double goal_dist = std::sqrt(std::pow(current_x_ - goal_x_, 2) +
+ std::pow(current_y_ - goal_y_, 2));
+ std::ostringstream oss;
+ if (!goal_received_) {
+ oss << "IDLE";
+ m.color.r = 0.6f; m.color.g = 0.6f; m.color.b = 0.6f; m.color.a = 1.0f;
+ } else if (path_indices_.empty()) {
+ oss << "PLANNING...";
+ m.color.r = 1.0f; m.color.g = 0.8f; m.color.b = 0.0f; m.color.a = 1.0f;
+ } else {
+ oss << std::fixed << std::setprecision(2)
+ << "NAV " << goal_dist << " m";
+ m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 0.4f; m.color.a = 1.0f;
+ }
+ m.text = oss.str();
+ m.lifetime = rclcpp::Duration::from_seconds(0.3);
+ status_text_pub_->publish(m);
+ }
+
+ rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+ rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr local_path_pub_;
+ rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr start_pose_pub_;
+ rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pose_pub_;
+ rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+ rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+ rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+ rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
+ rclcpp::TimerBase::SharedPtr timer_;
+ rclcpp::TimerBase::SharedPtr visualization_timer_;
+ rclcpp::TimerBase::SharedPtr control_timer_;
+ rclcpp::TimerBase::SharedPtr update_path_timer_;
+ rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_pub_;
+ rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr waypoints_pub_;
+ rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dynamic_obs_pub_;
+ rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr local_window_pub_;
+ rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr robot_footprint_pub_;
+ rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_arrow_pub_;
+ rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr path_arrow_pub_;
+ rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr lookahead_pub_;
+ rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr status_text_pub_;
+
+ std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+ std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+ std::unique_ptr<LocalPlanner> local_planner_;
+ LocalPlanner::Trajectory local_path_;
+
+ std::vector<int> path_indices_;
+ size_t current_waypoint_idx_ = 0;
+ double current_x_ = 0.0, current_y_ = 0.0, current_yaw_ = 0.0;
+ double target_x_ = 0.0, target_y_ = 0.0;
+ double start_x_ = 0.0, start_y_ = 0.0;
+ double offset_x_ = 0.0, offset_y_ = 0.0;
+ bool odom_received_ = false;
+ bool goal_received_ = false;
+ bool costmap_changed_ = false;
+ int width_, height_;
+ double resolution_;
+ double robot_radius_ = 0.3, inflation_margin_ = 0.2, inflation_radius_ = 1.5;
+ std::vector<double> costmap_;
+ double goal_x_ = 0.0, goal_y_ = 0.0;
+ std::vector<std::pair<double, double>> dynamic_obstacles_;
+ double current_path_length_ = std::numeric_limits<double>::max();
+ double max_linear_vel_, max_angular_vel_;
+ double lookahead_dist_;
+ double local_window_size_;
+ double local_plan_dt_;
+ int local_plan_steps_;
+ double safety_buffer_;
+ double goal_tolerance_ = 0.12;
+ double waypoint_reached_radius_ = 0.25;
+ double goal_approach_dist_ = 0.6;
+ double turn_in_place_min_dist_ = 0.5;
+ double planner_solve_time_ = 2.0;
+ double planner_occ_threshold_ = 5.0;
+ double rrt_range_ = 0.0;
+ double rrt_goal_bias_ = 0.05;
+ double prev_v_ = 0.0;
+ double prev_w_ = 0.0;
+ int scan_stride_ = 1;
+ std::string map_frame_, base_frame_;
+ bool is_turning_ = false;
+ bool warned_frame_mismatch_ = false;
+ rclcpp::Time turn_start_time_;
+};
+
+int main(int argc, char** argv) {
+ rclcpp::init(argc, argv);
+ auto node = std::make_shared<RRTStarNavNode>();
+ rclcpp::spin(node);
+ rclcpp::shutdown();
+ return 0;
+}

@@ -1,0 +1,56 @@
+autodock_node:
+  ros__parameters:
+    target_tag_id: 0
+    tag_family: "tag36h11"
+    tag_frame_override: ""     # laisser vide sauf si ta version d'apriltag_ros nomme les frames differemment
+    base_frame: "base_link"
+
+    # Distance a laquelle le robot doit s'arreter DEVANT le tag (le long de sa
+    # normale). A MESURER/AJUSTER sur ton robot reel : doit correspondre a la
+    # distance entre l'origine de base_link et le point de contact avant du
+    # robot, plus le degagement souhaite devant la station.
+    final_stop_distance: 0.40
+
+    # Rayon en-dessous duquel on bascule de "poursuite du point cible" a
+    # "cap verrouille sur la normale du tag" (approche finale rectiligne).
+    align_radius: 0.60
+
+    stop_distance_tolerance: 0.03
+    final_heading_tolerance: 0.05
+
+    approach_linear_speed: 0.25
+    final_approach_linear_speed: 0.08
+    max_angular_speed: 0.6
+    kp_heading: 1.5
+    kp_final_heading: 1.2   # reduit de 2.0 : trop nerveux face au bruit d'orientation AprilTag
+    kp_linear: 0.6
+
+    # A INVERSER (1.0 <-> -1.0) EN PREMIER si le robot part dans la mauvaise
+    # direction au demarrage du docking (voir commentaire en tete de
+    # autodock_node.cpp pour l'explication de la convention).
+    tag_normal_sign: 1.0
+
+    # Filtrage de la normale du tag (voir autodock_node.cpp) : alpha plus
+    # petit = plus lisse mais plus lent a reagir a un vrai changement d'angle.
+    normal_filter_alpha: 0.25
+    normal_ambiguity_dot_threshold: 0.0
+
+    # Direction de visee fixe de la camera dans base_frame_ (fait de montage :
+    # camera orientee vers l'avant du robot = (1.0, 0.0)). A adapter UNIQUEMENT
+    # si la camera n'est pas montee face a l'avant de base_link.
+    camera_forward_x: 1.0
+    camera_forward_y: 0.0
+
+    tag_lost_timeout: 1.0
+    search_rotate_speed: 0.3
+    search_timeout: 20.0
+    max_search_reattempts: 3
+
+    enable_blind_final_creep: true
+    blind_creep_speed: 0.05
+    blind_creep_duration: 1.0
+    blind_creep_trigger_distance: 0.15
+
+    control_period: 0.05
+    cmd_vel_topic: "cmd_vel"
+    status_topic: "autodock/status"

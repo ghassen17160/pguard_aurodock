@@ -1,0 +1,19 @@
+/**:
+  ros__parameters:
+    family: 36h11
+    size: 0.16          # taille du cote noir interieur, en metres (cf. tags.yaml)
+
+    # Parametres du detecteur (valeurs par defaut raisonnables pour un flux
+    # camera simulee 640x480 a 1280x720 ; augmenter decimate si le CPU sature)
+    max_hamming: 0
+    detector:
+      threads: 2
+      decimate: 1.0
+      blur: 0.0
+      refine: true
+      sharpening: 0.25
+      debug: false
+
+    # Publie la TF <camera_optical_frame> -> tag36h11:<id> pour chaque tag
+    # detecte avec une taille connue (necessaire au docking, cf. tags.yaml).
+    publish_tf: true

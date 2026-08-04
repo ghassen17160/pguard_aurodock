@@ -1,0 +1,87 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+  - Class: rviz_common/Views
+    Name: Views
+
+Visualization Manager:
+  Global Options:
+    Fixed Frame: map
+    Background Color: {R: 0.05, G: 0.05, B: 0.1}
+  Displays:
+    # Map SLAM
+    - Class: rviz_default_plugins/Map
+      Name: Map
+      Topic: /map
+      Alpha: 0.7
+      Color Scheme: map
+
+    # Ton Costmap PRM
+    - Class: rviz_default_plugins/Map
+      Name: PRM Costmap
+      Topic: /prm_costmap
+      Alpha: 0.65
+      Color Scheme: costmap
+
+    # Global Path (PRM)
+    - Class: rviz_default_plugins/Path
+      Name: Global Path
+      Topic: /prm_path
+      Color: {R: 0.0, G: 0.8, B: 1.0}
+      Line Width: 0.06
+
+    # Local Path (DWA)
+    - Class: rviz_default_plugins/Path
+      Name: Local Path
+      Topic: /local_path
+      Color: {R: 1.0, G: 0.4, B: 0.0}
+      Line Width: 0.04
+
+    # Robot Model
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Description Topic: /robot_description
+
+    # LaserScan
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Topic: /scan
+      Size (m): 0.08
+      Color: {R: 1.0, G: 0.2, B: 0.2}
+
+    # TF
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Marker Scale: 0.4
+
+    # Waypoints + Markers
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Waypoints
+      Topic: /prm_waypoints
+
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Dynamic Obstacles
+      Topic: /dynamic_obstacles
+
+    - Class: rviz_default_plugins/Marker
+      Name: Local Window
+      Topic: /local_window
+
+    - Class: rviz_default_plugins/Marker
+      Name: Robot Footprint
+      Topic: /robot_footprint
+
+  Tools:
+    - Class: rviz_default_plugins/SetGoal
+      Topic: /move_base_simple/goal
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic: /initialpose
+
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: TopDownOrtho

@@ -1,0 +1,18 @@
+material AprilTag/Tag36h11_00
+{
+  technique
+  {
+    pass
+    {
+      ambient 1 1 1 1
+      diffuse 1 1 1 1
+      specular 0.0 0.0 0.0 1 1
+
+      texture_unit
+      {
+        texture tag36h11_00.png
+        filtering none
+      }
+    }
+  }
+}

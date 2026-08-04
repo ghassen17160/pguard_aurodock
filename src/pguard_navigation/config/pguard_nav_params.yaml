@@ -1,0 +1,108 @@
+prm_nav_node:
+  ros__parameters:
+    use_sim_time: true
+
+    # --- Frames ---
+    map_frame: "map"
+    base_frame: "base_footprint"
+
+    # --- Carte / costmap local (couvre 40m x 40m autour du robot) ---
+    map_width: 400
+    map_height: 400
+    resolution: 0.10
+
+    # --- Securite / eloignement des obstacles ---
+    # inflation_radius: rayon (m) sur lequel le cout augmente autour d'un obstacle.
+    # safety_buffer: doit rester STRICTEMENT < inflation_radius. Plus il s'en rapproche,
+    #   plus le seuil de cout "libre" (safe_cost_threshold, calcule automatiquement et
+    #   affiche au demarrage) est bas -> le PRM est oblige de rester loin des obstacles.
+    #   ATTENTION: si vos couloirs les plus etroits sont proches de 2*safety_buffer de
+    #   large, le PRM risque de ne plus trouver de chemin ("Le PRM n'a pas trouve de
+    #   chemin"). Reduisez alors safety_buffer.
+    inflation_radius: 1.20
+    # safety_buffer: revenu a 0.45 (valeur de votre ancien fichier qui fonctionnait bien).
+    #   0.65 puis 0.52 se sont reveles trop stricts pour la largeur reelle de vos couloirs.
+    #   Ne le remontez que par petits pas de +0.03 en testant a chaque fois.
+    safety_buffer: 0.45
+    # prm_clearance_weight: SEUL levier change par rapport aux valeurs par defaut du code.
+    #   Defaut = 0.6. Augmente ici pour eloigner le chemin global des obstacles, comme
+    #   demande -- c'est un levier "doux" (objectif d'optimisation, pas une contrainte
+    #   dure), donc plus sur a ajuster seul que safety_buffer.
+    prm_clearance_weight: 0.9
+    invalid_path_confirm_count: 6
+
+    # --- Geometrie robot (chassis 1.4 x 0.75 x 0.60 m, base_link decale vers l'arriere) ---
+    # footprint_front + footprint_back doit correspondre a la longueur totale du chassis.
+    footprint_front: 0.80
+    footprint_back: 0.60
+    footprint_half_width: 0.46
+    # footprint_safety_margin: marge de securite REELLE ajoutee autour de l'empreinte pour
+    #   la detection de collision temps reel du DWA (evitement d'obstacles dynamiques).
+    #   Augmentez si le robot reel est plus large que la geometrie ci-dessus, ou si
+    #   l'odometrie est bruitee.
+    footprint_safety_margin: 0.12
+    obstacle_grid_cell_size: 0.3
+
+    # --- Cinematique (robot lourd, roues 0.4m de diametre, 80kg) ---
+    max_linear_vel: 0.40
+    max_angular_vel: 0.30
+    max_linear_accel: 0.7      # revenu a la valeur par defaut du code (0.35 degradait le DWA)
+    max_angular_accel: 2.0     # revenu a la valeur par defaut du code (0.8 degradait le DWA)
+
+    # --- Suivi de trajectoire (pure pursuit) ---
+    lookahead_dist: 0.60
+    # min_lookahead_dist: remis a 0.8 (valeur par defaut du code, jamais fixee dans votre
+    #   ancien fichier). Comme min > lookahead_dist ici, le lookahead adaptatif reste en
+    #   pratique constant a 0.8m quel que soit le virage -- c'est le comportement exact
+    #   avec lequel votre robot naviguait bien, on ne le change plus.
+    min_lookahead_dist: 0.8
+    lookahead_curvature_full_reduction: 1.2
+    local_plan_dt: 0.10
+    local_plan_steps: 30
+
+    # --- Planification globale PRM ---
+    prm_solve_time: 2.0
+    path_check_step: 0.15
+
+    # --- DWA (planificateur local) ---
+    dwa_v_step: 0.05
+    dwa_w_step: 0.1
+    dwa_heading_weight: 1.0
+    dwa_goal_weight: 1.2
+    dwa_velocity_weight: 1.5
+    dwa_obstacle_soft_weight: 1.0
+    dwa_path_weight: 1.5
+    dwa_path_corridor_slack: 0.25
+    dwa_corridor_relax_enter_dist: 0.6
+    dwa_corridor_relax_exit_dist: 1.2
+    dwa_path_deviation_hard_cap: 1.5
+
+    # --- Approche finale / rotation sur place ---
+    goal_tolerance: 0.12
+    final_approach_radius: 0.6
+    dwa_final_approach_heading_scale: 0.2
+    dwa_final_approach_goal_scale: 1.5
+    turn_in_place_enter_threshold: 1.8
+    turn_in_place_exit_threshold: 0.35
+    turn_in_place_kp: 1.2
+
+    # --- Watchdog anti-blocage / recuperation ---
+    stuck_timeout: 8.0
+    stuck_progress_epsilon: 0.03
+    safety_stop_recovery_timeout: 2.5
+    recovery_rotate_speed: 0.5
+    recovery_duration: 2.0
+    recovery_backup_speed: 0.15
+    recovery_backup_ratio: 0.4
+    goal_tolerance_relaxed: 0.25
+    max_recovery_attempts: 3
+
+    # --- Capteur / boucle de controle ---
+    scan_stride: 3              # n'affecte QUE la visualisation RViz (securite en pleine densite)
+    control_period: 0.05
+
+    # --- Couleur du marker de trajectoire locale (topic local_path_marker) ---
+    local_path_color_r: 0.0
+    local_path_color_g: 0.4
+    local_path_color_b: 1.0
+    local_path_color_a: 0.9
