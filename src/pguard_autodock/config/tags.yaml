@@ -10,6 +10,8 @@
 # par defaut ; ajuste le parametre 'tag_frame_override' cote autodock si ta
 # version d'apriltag_ros nomme les frames differemment.
 
-tag:
-  size: 0.16
-  ids: [0]
+/**:
+  ros__parameters:
+    tag:
+      size: 0.16
+      ids: [0]

@@ -6,14 +6,19 @@ autodock_node:
     base_frame: "base_link"
 
     # Distance a laquelle le robot doit s'arreter DEVANT le tag (le long de sa
-    # normale). A MESURER/AJUSTER sur ton robot reel : doit correspondre a la
-    # distance entre l'origine de base_link et le point de contact avant du
-    # robot, plus le degagement souhaite devant la station.
-    final_stop_distance: 0.40
+    # normale). CALCULEE a partir de la geometrie reelle du chassis (voir
+    # collision box dans robot_pguard_x.xacro : origin x=0.10, longueur=1.4 m
+    # -> bord avant physique a 0.10+0.70=0.80 m devant base_link) + une marge
+    # de securite de 0.10 m pour eviter tout contact au moment de l'arret.
+    # Si le contact final souhaite est different (charge par contact physique
+    # vs sans contact), reajuster en consequence.
+    final_stop_distance: 0.90
 
     # Rayon en-dessous duquel on bascule de "poursuite du point cible" a
     # "cap verrouille sur la normale du tag" (approche finale rectiligne).
-    align_radius: 0.60
+    # Augmente en meme temps que final_stop_distance pour garder assez de
+    # marge de decision/ralentissement avant l'arret.
+    align_radius: 1.20
 
     stop_distance_tolerance: 0.03
     final_heading_tolerance: 0.05

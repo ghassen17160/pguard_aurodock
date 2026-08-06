@@ -113,6 +113,15 @@ private:
     declare_parameter("kp_final_heading", 2.0);
     declare_parameter("kp_linear", 0.6);
 
+    // Correction d'ecart lateral (cross-track) en phase finale : le cap y
+    // est verrouille sur la normale du tag (pour eviter le zigzag), ce qui
+    // ne corrige PAS a lui seul un decalage lateral deja present a l'entree
+    // de cette phase -- le robot continuerait alors tout droit, parallele a
+    // la bonne trajectoire mais decale, jusqu'a sortir du champ de la
+    // camera. Ce gain ajoute une legere correction de cap proportionnelle a
+    // la distance perpendiculaire a la ligne d'approche ideale.
+    declare_parameter("kp_final_lateral", 1.0);
+
     declare_parameter("tag_normal_sign", 1.0);
 
     // Filtrage de la normale du tag (l'orientation estimee par apriltag_ros
