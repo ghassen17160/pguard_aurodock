@@ -1,23 +1,4 @@
-#############################################################################
-# nav2_params.yaml - PearlGuard (pguard_x) - ROS2 Humble
-#
-# Hypotheses de cette config :
-#   - Tu as maintenant une carte sauvegardee (pguard_map.pgm/.yaml), donc
-#     cette version utilise map_server + amcl (localisation sur carte fixe),
-#     PAS slam_toolbox en ligne. C'est le setup standard pour la phase
-#     "navigation" une fois la carte construite.
-#   - odom -> base_footprint est deja publie par les plugins
-#     gazebo_ros_diff_drive (voir tes commentaires [PGUARD_X]).
-#   - Footprint = boite de collision reelle du chassis (1.4 x 0.75 x 0.60,
-#     decalee de x=+0.10 par rapport a base_link), PAS une approximation
-#     circulaire comme dans ton safety_buffer_ custom. C'est plus precis
-#     mais un peu plus couteux en calcul (verification polygonale).
-#   - Planificateur global : SmacPlannerHybrid (equivalent standard Nav2 le
-#     plus proche de ton PRM -- il n'existe pas de plugin RRT/PRM natif).
-#   - Controleur local : DWB (l'equivalent officiel Nav2 de DWA).
-#   - Alternatives MPPI / TEB donnees en commentaire en bas de fichier pour
-#     comparaison ulterieure.
-#############################################################################
+
 
 map_server:
   ros__parameters:
@@ -89,16 +70,7 @@ controller_server:
       yaw_goal_tolerance: 0.15
       stateful: True
 
-    # -------------------------------------------------------------------
-    # DWB = equivalent officiel Nav2 de ton DwaLocalPlanner.
-    # Les criticis ci-dessous recreent l'esprit de tes FIX 19/23 :
-    #   - BaseObstacle + ObstacleFootprint = ton rejet dur de securite
-    #   - PathAlign + PathDist            = ton adherence au chemin global
-    #   - GoalAlign + GoalDist            = ton heading_cost / goal_cost
-    #   - PreferForward                   = ta recompense de vitesse
-    #     (empeche le "robot freezing problem" que tu decrivais)
-    #   - RotateToGoal                    = ton mode "approche finale"
-    # -------------------------------------------------------------------
+
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
@@ -160,14 +132,7 @@ planner_server:
     expected_planner_frequency: 5.0
     planner_plugins: ["GridBased"]
 
-    # -------------------------------------------------------------------
-    # SmacPlannerHybrid : planificateur global standard le plus proche de
-    # ton PRM (pas d'echantillonnage aleatoire, mais recherche sur graphe
-    # avec contraintes cinematiques -- adapte a un robot 4 roues non
-    # holonome comme pguard_x). Rejette aussi les trajectoires trop pres
-    # des obstacles via l'inflation layer du costmap (voir plus bas),
-    # comme ton safe_cost_threshold_.
-    # -------------------------------------------------------------------
+
     GridBased:
       plugin: "nav2_smac_planner/SmacPlannerHybrid"
       downsample_costmap: false
@@ -232,14 +197,7 @@ waypoint_follower:
       enabled: True
       waypoint_pause_duration: 200
 
-# ---------------------------------------------------------------------------
-# COSTMAPS
-# Footprint reel (polygone), pas un rayon : coin avant/arriere derives de ta
-# boite de collision <box size="1.4 0.75 0.60"/> centree en x=0.10 (voir
-# ton commentaire [PGUARD_X] dans prm_nav_node.cpp) :
-#   avant = 0.10 + 1.4/2 = 0.80 m,  arriere = 0.10 - 1.4/2 = -0.60 m
-#   demi-largeur = 0.75/2 = 0.375 m
-# ---------------------------------------------------------------------------
+
 local_costmap:
   local_costmap:
     ros__parameters:
@@ -307,40 +265,3 @@ global_costmap:
         cost_scaling_factor: 3.0
         inflation_radius: 1.2
       always_send_full_costmap: True
-
-#############################################################################
-# ALTERNATIVES POUR COMPARAISON ULTERIEURE (non actives par defaut)
-#
-# --- Option A : remplacer FollowPath par MPPI (le plus moderne, souvent
-#     plus robuste sur costmap bruite comme le tien avec le VLP-16 reel) ---
-#
-# controller_server:
-#   ros__parameters:
-#     controller_plugins: ["FollowPath"]
-#     FollowPath:
-#       plugin: "nav2_mppi_controller::MPPIController"
-#       time_steps: 56
-#       model_dt: 0.05
-#       batch_size: 2000
-#       vx_std: 0.2
-#       vy_std: 0.0
-#       wz_std: 0.4
-#       vx_max: 0.4
-#       vx_min: -0.04
-#       wz_max: 1.0
-#       critics: ["ConstraintCritic","CostCritic","GoalCritic","GoalAngleCritic",
-#                 "PathAlignCritic","PathFollowCritic","PathAngleCritic","PreferForwardCritic"]
-#
-# --- Option B : TEB (necessite le paquet teb_local_planner pour ROS2,
-#     verifier son etat de maintenance sur Humble avant de s'engager) ---
-#
-# controller_server:
-#   ros__parameters:
-#     controller_plugins: ["FollowPath"]
-#     FollowPath:
-#       plugin: "teb_local_planner::TebLocalPlannerROS"
-#       max_vel_x: 0.4
-#       max_vel_theta: 1.0
-#       min_obstacle_dist: 0.95   # equivalent de ton safety_buffer_
-#       inflation_dist: 1.2
-#############################################################################
