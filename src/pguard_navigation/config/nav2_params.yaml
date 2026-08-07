@@ -3,7 +3,7 @@
 map_server:
   ros__parameters:
     use_sim_time: True
-    yaml_filename: ""   # surcharge via l'argument de launch 'map' (voir launch file)
+    yaml_filename: ""   
 
 amcl:
   ros__parameters:
@@ -26,7 +26,7 @@ amcl:
     max_particles: 2000
     min_particles: 500
     laser_max_range: 20.0
-    laser_min_range: 0.45   # coherent avec min_range du VLP-16 dans robot_pguard_x.xacro
+    laser_min_range: 0.45   
     laser_model_type: "likelihood_field"
     update_min_a: 0.2
     update_min_d: 0.25
@@ -42,7 +42,7 @@ bt_navigator:
     odom_topic: /odom
     bt_loop_duration: 10
     default_server_timeout: 20
-    # BT par defaut fourni par nav2_bt_navigator (navigate_to_pose + recovery)
+
     default_nav_to_pose_bt_xml: "navigate_to_pose_w_replanning_and_recovery.xml"
     default_nav_through_poses_bt_xml: "navigate_through_poses_w_replanning_and_recovery.xml"
 
@@ -65,7 +65,7 @@ controller_server:
 
     general_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      # Correspond a ton goal_tolerance_ = 0.12 dans prm_nav_node.cpp
+
       xy_goal_tolerance: 0.12
       yaw_goal_tolerance: 0.15
       stateful: True
@@ -74,8 +74,8 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
-      # Bornes de vitesse : identiques a tes parametres max_linear_vel/max_angular_vel
-      min_vel_x: -0.04          # leger recul autorise, comme v_min = -max_linear_vel_*0.1
+  
+      min_vel_x: -0.04         
       min_vel_y: 0.0
       max_vel_x: 0.4
       max_vel_y: 0.0
@@ -123,7 +123,7 @@ controller_server:
       RotateToGoal.scale: 32.0
       RotateToGoal.slowing_factor: 5.0
       RotateToGoal.lookahead_time: -1.0
-      PreferForward.scale: 1.5    # equivalent de dwa_velocity_weight_ (FIX 19)
+      PreferForward.scale: 1.5    
       Oscillation.scale: 1.0
 
 planner_server:
@@ -141,12 +141,12 @@ planner_server:
       allow_unknown: true
       max_iterations: 1000000
       max_on_approach_iterations: 1000
-      max_planning_time: 3.0            # equivalent de ton prm_solve_time_
+      max_planning_time: 3.0          
       motion_model_for_search: "REEDS_SHEPP"
       angle_quantization_bins: 72
       analytic_expansion_ratio: 3.5
       analytic_expansion_max_length: 3.0
-      minimum_turning_radius: 0.60      # a affiner selon le rayon de braquage reel de pguard_x
+      minimum_turning_radius: 0.60     
       reverse_penalty: 2.0
       change_penalty: 0.0
       non_straight_penalty: 1.2
