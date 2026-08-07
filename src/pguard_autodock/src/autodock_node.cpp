@@ -1,37 +1,5 @@
-// ============================================================================
-// autodock_node.cpp
-// Package pguard_autodock - Docking automatique par AprilTag
-//
-// Principe general :
-//   apriltag_ros publie une TF <camera_frame> -> tag36h11:<id> a chaque
-//   detection du tag. Ce noeud interroge cette TF resolue automatiquement
-//   jusqu'a base_frame_ (via tf2, en s'appuyant sur l'arbre TF statique du
-//   robot deja publie par robot_state_publisher) : la translation obtenue
-//   donne directement la position du tag DANS LE REPERE DU ROBOT LUI-MEME.
-//
-//   Cela simplifie enormement le controleur : puisque base_frame_ est par
-//   definition l'origine du robot avec X = avant du robot, un simple calcul
-//   d'angle/distance sur cette translation donne directement la commande de
-//   direction/vitesse a appliquer, sans jamais avoir besoin des reperes
-//   map/odom ni de suivre le cap absolu du robot.
-//
-// Machine a etats :
-//   IDLE            -> attend un appel au service /start_docking
-//   SEARCHING       -> tag pas encore visible : rotation lente sur place
-//   APPROACH        -> tag visible, loin : poursuite du point cible (cap+dist)
-//   FINAL_APPROACH  -> tag visible, proche : cap verrouille sur la normale du
-//                       tag (approche rectiligne), vitesse reduite
-//   DOCKED          -> arrive a la distance/alignement cibles : robot immobile
-//   FAILED          -> echec (tag jamais trouve / perdu trop longtemps) :
-//                       robot immobile, en attente d'un nouvel ordre
-//
-// Convention d'orientation du tag (a verifier empiriquement, cf. parametre
-// tag_normal_sign) : l'axe +Z local du repere du tag est suppose pointer
-// VERS L'EXTERIEUR du panneau (cote camera/robot). Si le robot part dans la
-// mauvaise direction au demarrage du docking (recule au lieu d'avancer, ou
-// vise l'oppose du tag), inverser tag_normal_sign de 1.0 a -1.0 dans les
-// parametres -- aucune recompilation necessaire.
-// ============================================================================
+
+
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -113,42 +81,21 @@ private:
     declare_parameter("kp_final_heading", 2.0);
     declare_parameter("kp_linear", 0.6);
 
-    // Correction d'ecart lateral (cross-track) en phase finale : le cap y
-    // est verrouille sur la normale du tag (pour eviter le zigzag), ce qui
-    // ne corrige PAS a lui seul un decalage lateral deja present a l'entree
-    // de cette phase -- le robot continuerait alors tout droit, parallele a
-    // la bonne trajectoire mais decale, jusqu'a sortir du champ de la
-    // camera. Ce gain ajoute une legere correction de cap proportionnelle a
-    // la distance perpendiculaire a la ligne d'approche ideale.
+
     declare_parameter("kp_final_lateral", 1.0);
-
     declare_parameter("tag_normal_sign", 1.0);
-
-    // Filtrage de la normale du tag (l'orientation estimee par apriltag_ros
-    // est nettement plus bruitee que la position) : moyenne mobile
-    // exponentielle + rejet des inversions brutales (ambiguite de pose
-    // AprilTag, frequente a faible distance/angle quasi frontal).
     declare_parameter("normal_filter_alpha", 0.25);
     declare_parameter("normal_ambiguity_dot_threshold", 0.0);
-
-    // Direction de visee fixe de la camera dans base_frame_ (fait de montage,
-    // PAS une mesure). apriltag_ros ne peut detecter que la face avant d'un
-    // tag imprime : la normale valide doit donc TOUJOURS s'opposer a cette
-    // direction. Sert a desambiguiser la pose sans dependre de tag_x/tag_y
-    // (bruites, surtout juste apres une reacquisition pendant une rotation).
     declare_parameter("camera_forward_x", 1.0);
     declare_parameter("camera_forward_y", 0.0);
-
     declare_parameter("tag_lost_timeout", 1.0);
     declare_parameter("search_rotate_speed", 0.3);
     declare_parameter("search_timeout", 20.0);
     declare_parameter("max_search_reattempts", 3);
-
     declare_parameter("enable_blind_final_creep", true);
     declare_parameter("blind_creep_speed", 0.05);
     declare_parameter("blind_creep_duration", 1.0);
     declare_parameter("blind_creep_trigger_distance", 0.15);
-
     declare_parameter("control_period", 0.05);
     declare_parameter("cmd_vel_topic", std::string("cmd_vel"));
     declare_parameter("status_topic", std::string("autodock/status"));
@@ -220,11 +167,7 @@ private:
   void handleStartDocking(
     const std::shared_ptr<std_srvs::srv::Trigger::Request>,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-  {
-    // (Re)demarre toujours depuis un etat propre, meme si un docking etait
-    // deja en cours ou termine (succes ou echec) -- symetrique a la maniere
-    // dont un nouveau but reinitialise systematiquement l'etat dans
-    // prm_nav_node, pour un comportement previsible.
+
     state_ = State::SEARCHING;
     search_start_time_ = now();
     search_reattempts_ = 0;
@@ -255,8 +198,7 @@ private:
   // ---------------------------------------------------------------------
   // Utilitaires TF
   // ---------------------------------------------------------------------
-  // Tente de recuperer la position/normale du tag dans base_frame_. Retourne
-  // false si le tag n'a pas ete vu recemment (au-dela de tag_lost_timeout_).
+
   bool getTagInBaseFrame(double & tag_x, double & tag_y, double & normal_x, double & normal_y)
   {
     geometry_msgs::msg::TransformStamped tf_msg;
@@ -270,7 +212,7 @@ private:
     const rclcpp::Time stamp(tf_msg.header.stamp);
     const double age = (now() - stamp).seconds();
     if (age > tag_lost_timeout_) {
-      return false;  // derniere transform disponible trop ancienne : tag considere perdu
+      return false; 
     }
 
     tag_x = tf_msg.transform.translation.x;
@@ -281,29 +223,18 @@ private:
       tf_msg.transform.rotation.z, tf_msg.transform.rotation.w);
     const tf2::Matrix3x3 rot(q);
 
-    // Normale locale du tag (+Z du repere du tag), transformee dans base_frame_,
-    // puis projetee sur le plan XY (on suppose un panneau vertical).
     const tf2::Vector3 local_z(0.0, 0.0, 1.0);
     const tf2::Vector3 normal_base = rot * local_z * tag_normal_sign_;
 
     const double n_len = std::hypot(normal_base.x(), normal_base.y());
     if (n_len < 1e-6) {
-      // Tag vu presque exactement de profil : normale mal definie sur le plan
-      // XY, on ignore ce cycle plutot que de diviser par une norme quasi nulle.
+
       return false;
     }
     const double raw_normal_x = normal_base.x() / n_len;
     const double raw_normal_y = normal_base.y() / n_len;
 
-    // Desambiguisation physique (independante du filtre temporel, donc
-    // efficace des la toute premiere lecture apres une reacquisition) :
-    // apriltag_ros ne peut detecter que la face avant d'un tag imprime, donc
-    // sa normale doit forcement s'opposer a la direction de visee de la
-    // camera (fixe, definie par le montage -- PAS calculee a partir de
-    // tag_x/tag_y, qui sont bruites juste apres une reacquisition pendant
-    // une rotation de recherche, cf. logs : tag_x peut transitoirement
-    // paraitre "derriere" le robot alors que la normale, elle, reste fiable
-    // comme indicateur de la face reellement observee).
+
     double disambiguated_normal_x = raw_normal_x;
     double disambiguated_normal_y = raw_normal_y;
     const double dot_physical = raw_normal_x * camera_forward_x_ + raw_normal_y * camera_forward_y_;
@@ -312,18 +243,7 @@ private:
       disambiguated_normal_y = -raw_normal_y;
     }
 
-    // L'orientation estimee par apriltag_ros est nettement plus bruitee que
-    // la position, et sujette a l'ambiguite de pose classique d'AprilTag
-    // (deux solutions quasi opposees a courte distance/angle quasi frontal,
-    // cf. logs de debug : la normale peut s'inverser d'une frame a l'autre).
-    // On filtre donc en deux temps (apres la desambiguisation physique
-    // ci-dessus, qui gere le cas de la toute premiere lecture) :
-    //   1) rejet des inversions brutales encore residuelles (produit
-    //      scalaire avec la normale filtree precedente en-dessous du seuil)
-    //      -- mesure jetee, on garde l'ancienne estimation filtree ;
-    //   2) moyenne mobile exponentielle sur les mesures valides, pour lisser
-    //      le bruit frame-a-frame et eviter que la commande angulaire ne
-    //      sature a chaque petite fluctuation.
+
     if (!have_filtered_normal_) {
       filtered_normal_x_ = disambiguated_normal_x;
       filtered_normal_y_ = disambiguated_normal_y;
@@ -362,7 +282,7 @@ private:
   {
     switch (state_) {
       case State::IDLE:
-        return;  // rien a faire, robot laisse libre (prm_nav_node ou teleop)
+        return;  
 
       case State::SEARCHING:
         runSearching();
@@ -374,8 +294,7 @@ private:
         return;
 
       case State::DOCKED:
-        // Maintient la vitesse a zero en continu pour compenser toute derive
-        // (roue moteur non parfaitement freinee, leger glissement, etc.).
+  
         stopRobot();
         return;
 
@@ -421,16 +340,11 @@ private:
     }
     blind_creep_active_ = false;
 
-    // Point cible = position du tag + final_stop_distance le long de sa
-    // normale (donc du cote du robot) : c'est la ou l'origine du robot doit
-    // se trouver, face au tag, une fois le docking termine.
     const double target_x = tag_x + final_stop_distance_ * normal_x;
     const double target_y = tag_y + final_stop_distance_ * normal_y;
     const double distance_to_target = std::hypot(target_x, target_y);
     last_known_distance_to_target_ = distance_to_target;
 
-    // Cap requis pour faire face au tag une fois arrive (oppose a la normale,
-    // qui elle pointe du tag vers le robot).
     const double final_heading_error = normalizeAngle(std::atan2(-normal_y, -normal_x));
 
     const bool in_final_phase = distance_to_target <= align_radius_;
@@ -440,9 +354,7 @@ private:
     double linear_speed_cap;
     double kp_h;
     if (in_final_phase) {
-      // Phase finale : cap verrouille sur l'orientation du tag (approche
-      // rectiligne), pas sur le relevement instantane vers le point cible --
-      // evite tout zigzag/oscillation au dernier moment pres du contact.
+ 
       heading_error = final_heading_error;
       linear_speed_cap = final_approach_linear_speed_;
       kp_h = kp_final_heading_;
@@ -468,14 +380,10 @@ private:
     geometry_msgs::msg::Twist cmd;
     cmd.angular.z = std::clamp(kp_h * heading_error, -max_angular_speed_, max_angular_speed_);
 
-    // Ralentit fortement en virage marque : evite de "couper" vers le tag en
-    // arc trop serre lorsque le cap est encore tres desaligne en debut
-    // d'approche.
     const double heading_slowdown = std::max(0.15, 1.0 - std::abs(heading_error) / (M_PI / 2.0));
     cmd.linear.x = std::clamp(kp_linear_ * distance_to_target, 0.0, linear_speed_cap) * heading_slowdown;
 
-    // DEBUG (throttled a 2 Hz) : toutes les valeurs de controle pour
-    // diagnostiquer une derive de cap (rotation inattendue, perte du tag).
+ 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 500,
       "[DEBUG approach] phase=%s tag=(%.3f,%.3f) normal=(%.3f,%.3f) target=(%.3f,%.3f) "
@@ -492,12 +400,7 @@ private:
   {
     const double time_since_seen = (now() - tag_last_seen_time_).seconds();
 
-    // Repli "creep aveugle" : si le tag etait deja tres proche (quasi arrive)
-    // au moment ou il a disparu du champ de la camera -- cas frequent, la
-    // camera perd souvent le tag dans les derniers centimetres car il sort
-    // du champ de vision -- on avance tout droit sur une courte duree fixe
-    // plutot que d'abandonner ou de repartir en recherche, ce qui casserait
-    // un alignement deja quasiment correct.
+
     if (enable_blind_final_creep_ && !blind_creep_active_ &&
       last_known_distance_to_target_ >= 0.0 &&
       last_known_distance_to_target_ <= blind_creep_trigger_distance_)
@@ -527,16 +430,10 @@ private:
     }
 
     if (time_since_seen <= tag_lost_timeout_ * 3.0) {
-      // Perte tres recente/breve (occlusion passagere, vibration) : on
-      // continue simplement d'avancer prudemment avec la derniere commande
-      // connue plutot que de s'arreter net a chaque micro-perte de detection.
+
       return;
     }
 
-    // Perte prolongee : on abandonne l'approche en cours et on repart en
-    // recherche, avec un budget limite de tentatives pour ne pas boucler
-    // indefiniment si le tag est definitivement hors de vue (obstacle,
-    // eclairage, robot pousse hors trajectoire...).
     ++search_reattempts_;
     if (search_reattempts_ > max_search_reattempts_) {
       RCLCPP_ERROR(
