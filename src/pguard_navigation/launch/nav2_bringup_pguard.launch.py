@@ -1,27 +1,5 @@
 #!/usr/bin/env python3
-"""
-nav2_bringup_pguard.launch.py
 
-Lance la stack Nav2 complete pour la NAVIGATION sur carte fixe deja
-construite (pguard_map.pgm/.yaml) :
-  - map_server (charge la carte)
-  - amcl (localisation)
-  - controller_server / planner_server / behavior_server / bt_navigator /
-    waypoint_follower (navigation)
-  - deux lifecycle_manager (un pour la localisation, un pour la navigation)
-
-Ordre de lancement recommande (3 terminaux, ou un launch parent qui
-inclut les trois) :
-  1) ton launch gazebo + robot_state_publisher + joint_state_publisher
-     (celui que tu as deja)
-  2) ton launch pointcloud_to_laserscan
-     (SANS slam_toolbox cette fois : la carte est deja construite, on
-     n'a plus besoin de SLAM en ligne, seulement de /scan pour amcl et
-     l'obstacle_layer)
-  3) CE fichier, avec l'argument map pointant vers ta carte, ex:
-       ros2 launch pearlguard_description nav2_bringup_pguard.launch.py \\
-         map:=/home/ghassen/Desktop/2206/git/pguard1_ws/maps/pguard_map.yaml
-"""
 
 import os
 from ament_index_python.packages import get_package_share_directory
