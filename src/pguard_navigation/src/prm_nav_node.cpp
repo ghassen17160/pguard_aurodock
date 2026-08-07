@@ -1,65 +1,4 @@
-// ============================================================================
-// prm_nav_node.cpp  (v10)
-// Noeud de navigation autonome - PearlGuard (pguard)
-// Planification globale PRM (OMPL) + suivi local DWA
-//
-// Changements v10 (par rapport a v9) :
-//   - La carte etant statique et connue a l'avance, le comportement par defaut
-//     est desormais : un seul plan global au moment ou le but est recu (deja
-//     optimal/sur puisque calcule sur la carte complete), suivi ensuite SANS
-//     replanification de routine. Deux mecanismes de replan "de confort" sont
-//     desactives par defaut (reactivables via parametres) :
-//       * enable_periodic_replan (replan_timer_, 4s) : cherchait
-//         periodiquement un chemin plus court -- inutile une fois le premier
-//         plan deja optimal sur carte connue.
-//       * enable_replan_on_blocked_path (control_timer_) : replanifiait
-//         globalement des qu'un obstacle dynamique traversait temporairement
-//         le chemin -- c'est desormais exclusivement le role du DWA local
-//         (deviation + hysteresis + retour au chemin), sans jamais changer le
-//         chemin de reference choisi au depart.
-//     Le replan de secours declenche par le watchdog anti-blocage
-//     (stuck_timeout_, dans handleStuckRecovery) reste lui toujours actif,
-//     independamment de ces deux options : c'est le seul dernier recours en
-//     cas de blocage reel et prolonge, pas une replanification de routine.
-// Changements v9 (par rapport a v8) :
-//   - Garde-fou automatique: safety_buffer_ (utilise par le PRM/costmap pour
-//     juger un corridor "libre") est desormais releve au minimum requis par
-//     l'empreinte reelle du robot (footprint_half_width_/front_/back_ +
-//     footprint_safety_margin_) si le parametre configure est insuffisant.
-//     Corrige le cas ou le PRM planifie a travers un corridor etroit que le
-//     DWA (verification de footprint geometrique exacte) rejette ensuite
-//     systematiquement, provoquant un arret de securite permanent puis
-//     l'abandon du but apres echec des tentatives de recuperation.
-//   - mapCallback() ignore desormais les receptions de /map dont le contenu
-//     brut est identique a la derniere carte deja integree (deduplication),
-//     evitant de recalculer inutilement toute l'inflation statique (couteux)
-//     a chaque republication periodique de la carte par slam_toolbox en mode
-//     localisation.
-//   - requestReplan() assouplit desormais la marge d'inflation (jamais les
-//     vraies cellules kLethal) dans un disque autour du depart et du but,
-//     dans la copie de costmap utilisee pour CETTE planification uniquement.
-//     Corrige "PRM: There are no valid initial states!" en boucle infinie
-//     lorsque le robot se trouve deja (ex: passage etroit) plus pres d'un
-//     obstacle que le safety_buffer_ (releve par le garde-fou ci-dessus) ne
-//     l'exigerait -- le robot occupe deja cette position sans collision par
-//     definition, il ne doit donc jamais etre bloque d'y repartir.
-//
-// Changements v8 (par rapport a v7) :
-//   - Integration de la carte statique publiee par nav2_map_server (topic /map,
-//     QoS transient_local) : le costmap_ global est desormais initialise et
-//     realigne (largeur/hauteur/resolution/origine) a partir de la carte reelle
-//     au lieu d'une fenetre glissante centree sur le point de depart. Le PRM
-//     planifie ainsi directement en tenant compte des murs connus des le
-//     depart, au lieu de les decouvrir progressivement via le LiDAR (ce qui
-//     provoquait des chemins traversant des obstacles statiques puis
-//     recalcules tardivement en approche).
-//   - scanCallback() reconstruit costmap_ a partir de static_costmap_ + du scan
-//     courant a chaque cycle, au lieu d'accumulate les obstacles lethaux de
-//     facon permanente : un obstacle dynamique qui s'est deplace ne laisse
-//     plus de "fantome" bloquant indefiniment le planificateur.
-//   - odomCallback() / requestReplan() ne recalculent plus l'offset de la
-//     fenetre glissante lorsque la carte statique a deja fixe l'origine.
-// ============================================================================
+/
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -199,8 +138,7 @@ inline bool isXYSafe(
   return costmap[idx] <= safety_margin_cost;
 }
 
-// Recherche en spirale de la cellule sure la plus proche. Utilise en repli lorsque le
-// lissage (spline / Chaikin) produit un point qui tombe en zone a cout eleve.
+
 inline bool findNearestSafeCell(
   double x, double y, int width, int height, double resolution,
   double offset_x, double offset_y, const std::vector<double> & costmap,
@@ -231,13 +169,6 @@ inline bool findNearestSafeCell(
   return false;
 }
 
-// ----------------------------------------------------------------------------
-// Arrondi des angles vifs par subdivision de Chaikin, avec validation de securite.
-// Chaque point subdivise est verifie contre la costmap; s'il tombe en zone a cout
-// eleve, on tente un repli local (cellule sure la plus proche) et, en dernier
-// recours, on conserve le sommet d'origine pour ce coin (l'arrondi est simplement
-// annule localement plutot que de casser tout le chemin).
-// ----------------------------------------------------------------------------
 inline std::vector<std::pair<double, double>> chaikinSmoothSafe(
   const std::vector<std::pair<double, double>> & pts, int iterations, double ratio,
   int width, int height, double resolution, double offset_x, double offset_y,
@@ -289,9 +220,6 @@ inline std::vector<std::pair<double, double>> chaikinSmoothSafe(
   return current;
 }
 
-// ----------------------------------------------------------------------------
-// Interpolation par spline cubique naturelle
-// ----------------------------------------------------------------------------
 class CubicSpline
 {
 public:
@@ -605,9 +533,6 @@ std::vector<int> smoothPath(
 
   // Etape 1: shortcutting -- elimine le bruit dense du PRM et reduit aux points cles.
   // C'est important car la spline precedente, appliquee directement sur le chemin brut,
-  // retombait sur les points d'origine (souvent tres anguleux) des qu'un point interpole
-  // tombait en zone a cout eleve pres d'un obstacle -- ce qui reintroduisait exactement
-  // les angles vifs que l'on cherche a eliminer.
   const auto shortcut = simplifyPath(
     raw_path, width, height, resolution, offset_x, offset_y, costmap, safety_margin_cost);
   if (shortcut.size() < 3) {
@@ -624,14 +549,14 @@ std::vector<int> smoothPath(
 
   // Etape 2: arrondi des angles vifs (Chaikin), avec repli securise cellule par cellule.
   // C'est ce qui traite directement le probleme des "angles aigus" y compris pres des
-  // obstacles, la ou le chemin brut du PRM zigzague le plus.
+
   const auto rounded_coords = chaikinSmoothSafe(
     key_coords, /*iterations=*/2, /*ratio=*/0.2,
     width, height, resolution, offset_x, offset_y, costmap, safety_margin_cost);
 
   // Etape 3: interpolation spline cubique pour obtenir une courbe C1 continue.
   // En cas de point invalide, on cherche d'abord une cellule sure proche (au lieu de
-  // revenir brutalement au sommet d'origine, qui recreait les angles vifs).
+
   std::vector<double> x_coords, y_coords, t_coords;
   x_coords.reserve(rounded_coords.size());
   y_coords.reserve(rounded_coords.size());
@@ -675,8 +600,7 @@ std::vector<int> smoothPath(
   }
 
   // Etape 4: conversion en indices + dedoublonnage. Volontairement PAS de re-simplifyPath
-  // ici: un shortcut final sur la courbe lissee redonnerait des segments droits et
-  // annulerait tout l'arrondi effectue aux etapes 2-3.
+
   std::vector<int> smoothed_path;
   smoothed_path.reserve(smoothed_coords.size());
   int last_idx = -1;
@@ -695,7 +619,7 @@ std::vector<int> smoothPath(
 }
 
 // ----------------------------------------------------------------------------
-// Grille spatiale d'obstacles (recherche de voisinage O(1) amorti)
+// Grille spatiale d'obstacles
 // ----------------------------------------------------------------------------
 class ObstacleGrid
 {
@@ -839,9 +763,6 @@ public:
       std::max(footprint_front_, std::max(footprint_back_, footprint_half_width_)) +
       footprint_safety_margin_ + 0.1;
 
-    // Degagement evalue le long du couloir a venir (path_ref_points), pas seulement a la
-    // position actuelle du robot: c'est ce qui permet de ne relacher le suivi du chemin
-    // global QUE lorsqu'un obstacle intrude reellement le couloir devant le robot.
     double corridor_clearance = std::numeric_limits<double>::max();
     if (!path_ref_points.empty()) {
       const size_t sample_stride = std::max<size_t>(1, path_ref_points.size() / 15);
@@ -854,9 +775,7 @@ public:
       corridor_clearance = obstacle_grid.distanceToNearest(current_x, current_y, safety_buffer_ * 3.0);
     }
 
-    // Hysteresis: on n'entre en mode "evitement" (relachement du suivi du chemin) que si
-    // le couloir est clairement obstrue, et on n'en ressort que lorsque le degagement est
-    // nettement retabli. Evite les oscillations / divergences inutiles pres du chemin.
+ 
     if (!avoiding_obstacle_ && corridor_clearance < corridor_relax_enter_dist_) {
       avoiding_obstacle_ = true;
     } else if (avoiding_obstacle_ && corridor_clearance > corridor_relax_exit_dist_) {
@@ -868,9 +787,7 @@ public:
       const double t = std::clamp(corridor_clearance / corridor_relax_exit_dist_, 0.0, 1.0);
       effective_path_weight = path_weight_ * (0.25 + 0.75 * t);
     }
-    // Plafond de deviation autorisee: hors evitement, on reste tres proche du chemin
-    // global; en evitement, on autorise un ecart plus large (mais toujours borne) pour
-    // contourner l'obstacle, avant de revenir naturellement sur le chemin.
+
     const double allowed_deviation = avoiding_obstacle_
       ? path_deviation_hard_cap_
       : std::max(path_corridor_slack_ * 1.5, 0.3);
@@ -956,10 +873,7 @@ private:
     const double sin_y = std::sin(-ryaw);
     const double lx = dx * cos_y - dy * sin_y;
     const double ly = dx * sin_y + dy * cos_y;
-    // Marge de securite ajoutee autour de l'empreinte geometrique stricte: sans elle, seul
-    // un chevauchement exact obstacle/robot etait rejete (zero degagement), ce qui laissait
-    // le DWA raser les murs au plus juste -- suffisant pour provoquer une collision au
-    // moindre bruit d'odometrie/latence de commande.
+
     return (
       lx > -(footprint_back_ + footprint_safety_margin_) &&
       lx < (footprint_front_ + footprint_safety_margin_) &&
@@ -1028,9 +942,7 @@ private:
         min_dist = std::min(min_dist, std::hypot(px - x, py - y));
       }
       if (min_dist > path_corridor_slack_) {
-        // Penalite quadratique (et non lineaire) au-dela du corridor: la trajectoire est
-        // de plus en plus penalisee au fur et a mesure qu'elle s'eloigne, ce qui favorise
-        // un retour rapide au chemin global des que l'obstacle est contourne.
+
         const double excess = min_dist - path_corridor_slack_;
         cost_sum += excess * excess;
       }
@@ -1038,8 +950,7 @@ private:
     return cost_sum / static_cast<double>(traj.points.size());
   }
 
-  // Deviation maximale (et non moyenne) entre la trajectoire et le chemin global: sert de
-  // garde-fou dur pour empecher le local planner de trop diverger sans justification.
+
   double computeMaxPathDeviation(
     const Trajectory & traj,
     const std::vector<std::pair<double, double>> & path_ref_points) const
@@ -1190,13 +1101,6 @@ private:
     declare_parameter("map_topic", "map");
     declare_parameter("unknown_cost_is_traversable", true);
 
-    // La carte etant statique et connue a l'avance, un seul plan global initial suffit
-    // en principe : ces deux options, desactivees par defaut, controlent les
-    // replanifications "de confort" qui n'ont plus lieu d'etre dans ce contexte (elles
-    // restent disponibles pour un usage avec carte partiellement inconnue/evolutive).
-    // Le replan de secours declenche par le watchdog anti-blocage (stuck_timeout_)
-    // reste lui toujours actif, quel que soit ce reglage : c'est le dernier recours
-    // en cas de blocage reel prolonge, pas une replanification de routine.
     declare_parameter("enable_periodic_replan", false);
     declare_parameter("enable_replan_on_blocked_path", false);
   }
@@ -1225,24 +1129,7 @@ private:
     footprint_safety_margin_ = get_parameter("footprint_safety_margin").as_double();
     obstacle_grid_cell_size_ = get_parameter("obstacle_grid_cell_size").as_double();
 
-    // ---------------------------------------------------------------------
-    // Garde-fou : coherence safety_buffer_ / inflation_radius_ vs empreinte reelle.
-    //
-    // Le PRM (global) valide une cellule uniquement si sa distance a l'obstacle le
-    // plus proche depasse safety_buffer_ (cf. computeSafeCostThreshold). Le DWA
-    // (local) verifie lui la vraie geometrie de l'empreinte (footprint_half_width_
-    // + footprint_safety_margin_ de chaque cote). Si safety_buffer_ est configure
-    // plus petit que ce que l'empreinte exige reellement, le PRM peut planifier un
-    // chemin traversant un corridor techniquement "libre" cote costmap mais
-    // physiquement trop etroit pour le robot -- le DWA rejette alors *toutes* les
-    // trajectoires locales sur ce troncon (aucune ne passe la verification de
-    // footprint), le robot s'arrete en securite, la recuperation echoue a
-    // repetition faute d'alternative, et le but finit par etre abandonne.
-    //
-    // On releve donc automatiquement safety_buffer_ au minimum requis par
-    // l'empreinte (avec une petite marge supplementaire), et on s'assure que
-    // inflation_radius_ reste strictement superieur, pour que le seuil de cout
-    // derive (computeSafeCostThreshold) reste bien defini et coherent.
+
     {
       const double footprint_half_extent =
         std::max({footprint_front_, footprint_back_, footprint_half_width_});
@@ -1263,20 +1150,7 @@ private:
         safety_buffer_ = min_required_safety_buffer;
       }
 
-      // L'ancienne condition "inflation_radius_ > safety_buffer_" est insuffisante :
-      // le seuil de validite OMPL est threshold = 15*(1 - safety_buffer_/inflation_radius_),
-      // qui peut tomber SOUS le cout de base d'une cellule libre (cost::kFreeSpace = 5.0)
-      // des que le ratio safety_buffer_/inflation_radius_ depasse 2/3 -- meme si
-      // inflation_radius_ > safety_buffer_ au sens strict. Dans ce cas, AUCUNE cellule,
-      // pas meme une cellule totalement degagee loin de tout obstacle, ne passe la
-      // verification "costmap[idx] < threshold" : le PRM echoue alors partout avec
-      // "no valid initial states", meme apres assouplissement de la bulle de depart
-      // (relaxCostmapBubble remet le cout a kFreeSpace, ce qui ne suffit pas si
-      // threshold est deja sous kFreeSpace).
-      //
-      // On exige donc inflation_radius_ >= 2 * safety_buffer_, ce qui garantit
-      // threshold = 15*(1-0.5) = 7.5, confortablement au-dessus de kFreeSpace (5.0)
-      // avec une marge de 2.5.
+
       const double min_required_inflation_radius = 2.0 * safety_buffer_;
       if (inflation_radius_ < min_required_inflation_radius) {
         RCLCPP_WARN(
@@ -1346,13 +1220,6 @@ private:
 
     safe_cost_threshold_ = computeSafeCostThreshold(safety_buffer_, inflation_radius_);
 
-    // Filet de securite final : quelle que soit la source des parametres (garde-fous
-    // ci-dessus ou configuration manuelle directe de safety_buffer_/inflation_radius_),
-    // on verifie explicitement ici que le seuil resultant reste au-dessus du cout de
-    // base d'une cellule libre. Si ce n'est pas le cas, le PRM echouerait sur la carte
-    // entiere (y compris en zone totalement degagee) avec "no valid initial states" --
-    // on releve alors safety_buffer_ a la baisse plutot que de laisser ce cas de figure
-    // se produire silencieusement au premier replan.
     if (safe_cost_threshold_ <= cost::kFreeSpace) {
       const double capped_safety_buffer = inflation_radius_ * (1.0 - (cost::kFreeSpace + 2.0) / 15.0);
       RCLCPP_ERROR(
@@ -1424,33 +1291,19 @@ private:
         pollPlanningResult();
 
         if (path_indices_.empty() && !planning_in_progress_) {
-          // Seul point ou une planification globale est demandee dans le fonctionnement
-          // "nominal" : au tout premier plan (juste apres reception du but). La carte
-          // etant statique et connue a l'avance, ce plan initial est cense etre deja
-          // sur/optimal ; il n'est ensuite plus modifie tant qu'aucun blocage reel et
-          // prolonge ne l'exige (cf. watchdog anti-blocage dans handleStuckRecovery,
-          // seul autre declencheur de replan global, utilise en tout dernier recours).
+
           requestReplan(false);
           invalid_path_streak_ = 0;
         } else if (enable_replan_on_blocked_path_ &&
           !path_indices_.empty() && costmap_changed_ && !planning_in_progress_)
         {
-          // Desactive par defaut (enable_replan_on_blocked_path=false) : la carte etant
-          // statique, un obstacle dynamique qui traverse temporairement le chemin
-          // global ne doit pas declencher de replanification globale -- c'est au DWA
-          // (planificateur local) de s'en ecarter puis d'y revenir naturellement via
-          // son mecanisme d'hysteresis (avoiding_obstacle_ / corridor slack), sans
-          // jamais changer le chemin de reference choisi au depart. Reactivable si la
-          // carte n'est pas totalement fiable/statique dans un deploiement donne.
+
           if (!isPathValid()) {
             ++invalid_path_streak_;
           } else {
             invalid_path_streak_ = 0;
           }
-          // Exige plusieurs controles consecutifs en echec avant de replanifier: un seul
-          // releve de cout limite (bruit capteur, arrondi d'inflation) ne doit pas a lui
-          // seul declencher un cycle replan/recuperation -- c'est ce qui causait le
-          // comportement "avance/recule/tourne" observe avec un safety_buffer plus strict.
+
           if (invalid_path_streak_ >= invalid_path_confirm_count_) {
             static rclcpp::Time last_plan_time = get_clock()->now();
             if ((get_clock()->now() - last_plan_time).seconds() > 1.5) {
@@ -1471,12 +1324,7 @@ private:
     replan_timer_ = create_wall_timer(
       std::chrono::milliseconds(4000),
       [this]() {
-        // Desactive par defaut (enable_periodic_replan=false) : ce timer cherchait
-        // periodiquement un chemin "plus court" que le chemin global courant, ce qui
-        // n'a plus d'interet une fois la carte statique connue a l'avance -- le tout
-        // premier plan (cf. control_timer_) est deja optimal/sur au sens du PRM des le
-        // depart, et le rejouer ne fait qu'ajouter une charge de calcul inutile et un
-        // risque de changement de chemin non sollicite en cours de route.
+
         if (!enable_periodic_replan_) {
           return;
         }
@@ -1519,12 +1367,6 @@ private:
   // Callbacks
   // ---------------------------------------------------------------------
 
-  // Reception de la carte statique publiee par nav2_map_server. Fixe definitivement
-  // les dimensions/resolution/origine du costmap sur celles de la vraie carte, et
-  // pre-calcule l'inflation autour de chaque obstacle statique une seule fois. Toute
-  // planification et toute fusion d'obstacles dynamiques (scanCallback) s'appuient
-  // ensuite sur ce referentiel fixe, au lieu de la fenetre glissante utilisee en
-  // l'absence de carte (mode degrade, cf. odomCallback).
   void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
   {
     if (msg->info.width == 0 || msg->info.height == 0) {
@@ -1532,13 +1374,7 @@ private:
       return;
     }
 
-    // slam_toolbox (mode localisation) republie /map periodiquement (toutes les ~1s
-    // dans certaines configs) meme quand son contenu n'a pas change. Recalculer toute
-    // l'inflation (potentiellement des milliers de cellules) a chaque reception est
-    // couteux et, sur l'executeur mono-thread par defaut, peut retarder le
-    // control_timer_ le temps du calcul -- un facteur aggravant possible des arrets de
-    // securite observes. On ignore donc silencieusement les receptions dont le contenu
-    // brut est identique a la derniere carte deja integree.
+
     const bool same_dims =
       map_received_ &&
       static_cast<int>(msg->info.width) == width_ &&
@@ -1560,9 +1396,7 @@ private:
     for (size_t i = 0; i < static_costmap_.size(); ++i) {
       const int8_t occ = msg->data[i];
       if (occ < 0) {
-        // Cellule "inconnue" (non explorees lors du SLAM d'origine): traitee comme
-        // franchissable mais avec un cout legerement superieur au libre, afin que le PRM
-        // les evite quand une alternative connue existe sans pour autant les interdire.
+
         static_costmap_[i] = unknown_cost_is_traversable_ ? cost::kTraversable : cost::kLethal;
       } else if (occ >= 65) {
         static_costmap_[i] = cost::kLethal;
@@ -1587,9 +1421,6 @@ private:
       width_, height_, resolution_, offset_x_, offset_y_);
   }
 
-  // Inflation d'un obstacle de la carte statique. Appelee uniquement au chargement de la
-  // carte (mapCallback deja verrouille costmap_mutex_) ; distincte de inflateObstacle()
-  // qui gere les obstacles dynamiques detectes en temps reel par le LiDAR.
   void inflateStatic(int obs_idx)
   {
     const int obs_x = obs_idx % width_;
@@ -1641,9 +1472,7 @@ private:
     if (!odom_received_) {
       start_x_ = current_x_;
       start_y_ = current_y_;
-      // Si une carte statique a deja ete recue, offset_x_/offset_y_ sont deja fixes par
-      // mapCallback() sur la vraie origine de la carte : ne pas les ecraser ici, sinon
-      // le costmap se desalignerait de la carte au tout premier message d'odometrie.
+
       if (!map_received_) {
         offset_x_ = start_x_ - (width_ * resolution_ / 2.0);
         offset_y_ = start_y_ - (height_ * resolution_ / 2.0);
@@ -1739,13 +1568,6 @@ private:
       return;
     }
 
-    // IMPORTANT: deux listes distinctes.
-    // - new_safety_obstacles: densite COMPLETE (tous les rayons valides), utilisee pour
-    //   l'ObstacleGrid du DWA (evitement de collision temps reel). Sous-echantillonner ici
-    //   pouvait laisser passer un mur fin ou un coin entre deux rayons consecutifs, d'ou des
-    //   collisions lorsque le local planner divergeait pour eviter un autre obstacle.
-    // - new_viz_obstacles: sous-echantillonnee (scan_stride), uniquement pour l'affichage
-    //   RViz (allege le rendu, aucun impact sur la securite).
     std::vector<std::pair<double, double>> new_safety_obstacles;
     std::vector<std::pair<double, double>> new_viz_obstacles;
     new_safety_obstacles.reserve(msg->ranges.size());
@@ -1754,12 +1576,6 @@ private:
     {
       std::lock_guard<std::mutex> lock(costmap_mutex_);
 
-      // Le costmap est reconstruit a partir de la base (carte statique si disponible,
-      // sinon fond neutre) a CHAQUE scan, puis les obstacles lethaux du scan courant sont
-      // reappliques par-dessus. Cela evite qu'un obstacle dynamique qui s'est deplace
-      // reste marque lethal indefiniment (les anciennes versions accumulaient les
-      // marquages de facon permanente, ce qui pouvait finir par bloquer le planificateur
-      // sur des "fantomes" d'obstacles qui ne sont plus la).
       costmap_ = map_received_
         ? static_costmap_
         : std::vector<double>(static_cast<size_t>(width_) * static_cast<size_t>(height_), 1.0);
@@ -1797,8 +1613,7 @@ private:
     dynamic_obstacles_viz_ = std::move(new_viz_obstacles);
   }
 
-  // Inflation d'un obstacle dynamique detecte par le LiDAR dans le cycle courant.
-  // costmap_mutex_ deja verrouille par l'appelant (scanCallback).
+
   void inflateObstacle(int obs_idx)
   {
     const int obs_x = obs_idx % width_;
@@ -1831,11 +1646,6 @@ private:
     bool replace_if_shorter_only = false;
   };
 
-  // Relache le cout d'inflation (jamais les cellules kLethal) dans un disque de rayon
-  // radius centre sur (cx, cy), au sein d'une copie de costmap donnee. Utilise pour
-  // garantir que la position actuelle du robot et le but restent toujours consideres
-  // comme valides par le PRM meme s'ils sont plus proches d'un obstacle que
-  // safety_buffer_ ne l'exigerait normalement -- cf. commentaire dans requestReplan().
   void relaxCostmapBubble(std::vector<double> & costmap, double cx, double cy, double radius) const
   {
     const int cells = std::max(1, static_cast<int>(std::ceil(radius / resolution_)));
@@ -1866,11 +1676,6 @@ private:
       return false;
     }
 
-    // Si aucune carte statique n'a ete recue, on reste en mode degrade "fenetre glissante"
-    // centree sur le point de depart courant (comportement historique). Des qu'une carte
-    // est chargee, offset_x_/offset_y_ restent fixes sur son origine et ne doivent plus
-    // jamais etre recalcules ici, sous peine de desaligner le costmap de la carte reelle
-    // a chaque replan.
     if (!map_received_) {
       offset_x_ = start_x_ - (width_ * resolution_ / 2.0);
       offset_y_ = start_y_ - (height_ * resolution_ / 2.0);
@@ -1885,24 +1690,7 @@ private:
       goal_index = coordsToIndex(goal_x_, goal_y_, width_, resolution_, offset_x_, offset_y_);
     }
 
-    // Assouplit la marge d'inflation (jamais les vrais obstacles kLethal) autour du
-    // depart et du but, dans CETTE copie de costmap uniquement.
-    //
-    // Le robot occupe deja physiquement sa position actuelle sans etre en collision --
-    // par definition, cette position est donc "sure" au sens strict, meme si elle ne
-    // respecte pas la marge safety_buffer_ (ex: robot deja engage dans un passage
-    // etroit, entre deux obstacles proches). Sans cet assouplissement, le seuil de
-    // validite OMPL strict (safe_cost_threshold_, aligne sur l'empreinte reelle depuis
-    // le garde-fou v9) rejetterait l'etat de depart lui-meme des que le robot se
-    // trouve dans une zone plus contrainte que safety_buffer_ : le PRM echouerait alors
-    // indefiniment avec "no valid initial states", sans aucune possibilite de
-    // replanifier meme pour sortir de cette zone (cf. logs "Discarded start state").
-    //
-    // On ne relache que le cout d'inflation (cellules non lethales), jamais les
-    // cellules kLethal elles-memes : le planificateur ne pourra donc toujours pas
-    // traverser un mur reel, seulement ignorer la marge de securite autour du point de
-    // depart/but exact. Le DWA reste de toute facon la garde-fou final sur le
-    // deplacement reel (verification de footprint geometrique stricte).
+
     const double relax_radius =
       std::max({footprint_front_, footprint_back_, footprint_half_width_}) + 0.05;
     relaxCostmapBubble(costmap_snapshot, current_x_, current_y_, relax_radius);
@@ -1957,9 +1745,7 @@ private:
     }
 
     auto new_path = pending_plan_->future.get();
-    // Si une recuperation a demande un remplacement complet forcE pendant que cette
-    // planification (potentiellement lancee en mode "plus court seulement") etait deja
-    // en cours, on l'honore ici plutot que de la perdre silencieusement.
+
     const bool force_full_replace = pending_force_full_replace_;
     pending_force_full_replace_ = false;
     const bool replace_if_shorter_only = pending_plan_->replace_if_shorter_only && !force_full_replace;
@@ -1984,8 +1770,7 @@ private:
       RCLCPP_INFO(
         get_logger(), "Nouveau chemin PRM: %zu points, longueur=%.2f m", path_indices_.size(), new_length);
     } else if (new_length < current_path_length_ * 0.9) {
-      // current_path_length_ peut valoir "infini" (aucun chemin de reference valide pour
-      // comparaison) -- on evite alors d'imprimer un nombre astronomique dans le log.
+
       if (std::isfinite(current_path_length_)) {
         RCLCPP_INFO(
           get_logger(), "Meilleur chemin trouve: %.2f m -> %.2f m", current_path_length_, new_length);
@@ -2077,10 +1862,7 @@ private:
     return {px, py};
   }
 
-  // Declenche une recuperation (recul bref si degage, puis rotation) et gere le budget de
-  // tentatives. Partagee entre le watchdog de progression (stuck_timeout_) et le
-  // declenchement rapide sur arret de securite prolonge (safety_stop_recovery_timeout_).
-  // Retourne false si le but a ete abandonne/accepte plutot que de tenter une recuperation.
+
   bool triggerRecovery()
   {
     const double goal_distance = std::hypot(current_x_ - goal_x_, current_y_ - goal_y_);
@@ -2133,13 +1915,6 @@ private:
     return true;
   }
 
-  // Surveille la progression vers le but. Si le robot ne progresse plus pendant plus de
-  // stuck_timeout_ secondes (typiquement une oscillation infinie pres du but, ou un blocage
-  // local), declenche une recuperation (recul puis rotation sur place, puis replanification
-  // forcee). Si la recuperation echoue plusieurs fois de suite, abandonne proprement le but
-  // (ou l'accepte si suffisamment proche) plutot que de rester bloque indefiniment.
-  // Retourne true si une commande a deja ete publiee (recuperation en cours) et que le
-  // suivi normal du chemin doit etre saute pour ce cycle.
   bool handleStuckRecovery()
   {
     const rclcpp::Time now = get_clock()->now();
@@ -2158,10 +1933,7 @@ private:
 
     if (recovery_active_) {
       if (now < recovery_end_time_) {
-        // Phase 1 (debut) : recul bref si le degagement arriere le permet -- souvent
-        // suffisant pour se decoller d'un obstacle en face avant de tourner.
-        // Phase 2 (fin) : rotation sur place pour se reorienter avant de rester bloque a
-        // nouveau au meme endroit.
+
         const double elapsed = recovery_duration_ - (recovery_end_time_ - now).seconds();
         const double backup_phase_end = recovery_duration_ * recovery_backup_ratio_;
 
@@ -2192,11 +1964,7 @@ private:
       path_indices_.clear();
       current_path_length_ = std::numeric_limits<double>::max();
       if (planning_in_progress_) {
-        // Une planification (ex: requete periodique "plus court seulement") est deja en
-        // cours: on la laisse terminer mais on force son resultat, a sa resolution, a
-        // etre traite comme un remplacement complet -- sinon cette demande de
-        // recuperation serait silencieusement perdue (et le chemin resterait vide plus
-        // longtemps que necessaire).
+
         pending_force_full_replace_ = true;
       } else {
         requestReplan(false);
@@ -2301,9 +2069,6 @@ private:
       const size_t start_ref = (path_cursor_idx_ > 5) ? path_cursor_idx_ - 5 : 0;
       const double cutoff_length = adaptive_lookahead * 2.0 + 1.0;
 
-      // Longueur totale du tronçon pertinent, pour calibrer un pas d'echantillonnage
-      // raisonnable (evite un nombre de points explosif sur un long chemin degage,
-      // tout en restant assez dense pour un chemin court/rectiligne).
       double relevant_length = 0.0;
       for (size_t i = start_ref; i + 1 < path_indices_.size() && relevant_length < cutoff_length; ++i) {
         double x1, y1, x2, y2;
@@ -2328,8 +2093,7 @@ private:
       }
 
       if (path_ref_points.empty()) {
-        // Chemin degenere (un seul point restant): repli sur les sommets bruts pour ne
-        // pas desactiver completement le corridor.
+ 
         for (size_t i = start_ref; i < path_indices_.size(); ++i) {
           double px, py;
           indexToCoords(path_indices_[i], width_, resolution_, offset_x_, offset_y_, px, py);
