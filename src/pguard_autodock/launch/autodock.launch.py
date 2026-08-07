@@ -13,8 +13,7 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(pkg, 'launch', 'apriltag.launch.py')
         )
-        # Pour surcharger les topics camera si differents des valeurs par
-        # defaut, ajouter ici : launch_arguments={'image_topic': '...', ...}.items()
+
     )
 
     autodock_node = Node(
