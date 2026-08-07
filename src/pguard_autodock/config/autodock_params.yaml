@@ -2,22 +2,12 @@ autodock_node:
   ros__parameters:
     target_tag_id: 0
     tag_family: "tag36h11"
-    tag_frame_override: ""     # laisser vide sauf si ta version d'apriltag_ros nomme les frames differemment
+    tag_frame_override: ""     
     base_frame: "base_link"
 
-    # Distance a laquelle le robot doit s'arreter DEVANT le tag (le long de sa
-    # normale). CALCULEE a partir de la geometrie reelle du chassis (voir
-    # collision box dans robot_pguard_x.xacro : origin x=0.10, longueur=1.4 m
-    # -> bord avant physique a 0.10+0.70=0.80 m devant base_link) + une marge
-    # de securite de 0.10 m pour eviter tout contact au moment de l'arret.
-    # Si le contact final souhaite est different (charge par contact physique
-    # vs sans contact), reajuster en consequence.
     final_stop_distance: 0.90
 
-    # Rayon en-dessous duquel on bascule de "poursuite du point cible" a
-    # "cap verrouille sur la normale du tag" (approche finale rectiligne).
-    # Augmente en meme temps que final_stop_distance pour garder assez de
-    # marge de decision/ralentissement avant l'arret.
+
     align_radius: 1.20
 
     stop_distance_tolerance: 0.03
@@ -27,22 +17,17 @@ autodock_node:
     final_approach_linear_speed: 0.08
     max_angular_speed: 0.6
     kp_heading: 1.5
-    kp_final_heading: 1.2   # reduit de 2.0 : trop nerveux face au bruit d'orientation AprilTag
+    kp_final_heading: 1.2   
     kp_linear: 0.6
 
-    # A INVERSER (1.0 <-> -1.0) EN PREMIER si le robot part dans la mauvaise
-    # direction au demarrage du docking (voir commentaire en tete de
-    # autodock_node.cpp pour l'explication de la convention).
+
     tag_normal_sign: 1.0
 
-    # Filtrage de la normale du tag (voir autodock_node.cpp) : alpha plus
-    # petit = plus lisse mais plus lent a reagir a un vrai changement d'angle.
+
     normal_filter_alpha: 0.25
     normal_ambiguity_dot_threshold: 0.0
 
-    # Direction de visee fixe de la camera dans base_frame_ (fait de montage :
-    # camera orientee vers l'avant du robot = (1.0, 0.0)). A adapter UNIQUEMENT
-    # si la camera n'est pas montee face a l'avant de base_link.
+
     camera_forward_x: 1.0
     camera_forward_y: 0.0
 
