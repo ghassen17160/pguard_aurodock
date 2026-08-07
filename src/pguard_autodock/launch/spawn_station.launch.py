@@ -11,12 +11,7 @@ def generate_launch_description():
     model_path = os.path.join(pkg, 'models', 'pguard_charging_station', 'model.sdf')
     models_dir = os.path.join(pkg, 'models')
 
-    # Les <uri>model://pguard_charging_station/...</uri> du SDF (script de
-    # materiau + texture du tag AprilTag) sont resolues par Gazebo via
-    # GAZEBO_MODEL_PATH, PAS par rapport au chemin passe a -file. Sans ce
-    # dossier dans le path, Gazebo ne trouve pas le materiau et retombe sur
-    # le blanc par defaut. On prefixe le path existant pour ne pas ecraser
-    # les autres dossiers de modeles deja configures (turtlebot3, etc.).
+
     existing_gazebo_model_path = os.environ.get('GAZEBO_MODEL_PATH', '')
     set_model_path = SetEnvironmentVariable(
         'GAZEBO_MODEL_PATH',
