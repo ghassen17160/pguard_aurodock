@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""
-Genere une image PNG d'un tag AprilTag (famille tag36h11) pour un ID donne,
-utilisable directement comme texture de la station de recharge dans Gazebo.
 
-Utilise le dictionnaire cv2.aruco.DICT_APRILTAG_36h11, qui reproduit fidelement
-l'encodage bit-a-bit de la famille officielle tag36h11 utilisee par la
-bibliotheque AprilTag (et donc par apriltag_ros) : le tag genere ici est bien
-detectable par le detecteur reel, pas seulement par OpenCV.
-
-Usage:
-    python3 generate_apriltag_image.py --id 0 --size 600 --border 0.2 \
-        --output tag36h11_00.png
-"""
 import argparse
 import sys
 
@@ -29,8 +17,7 @@ def generate_tag(tag_id: int, size_px: int, border_fraction: float) -> np.ndarra
         marker = np.zeros((size_px, size_px), dtype=np.uint8)
         cv2.aruco.drawMarker(aruco_dict, tag_id, size_px, marker, 1)
 
-    # Marge blanche ("quiet zone") autour du tag : indispensable pour une
-    # detection fiable, le detecteur a besoin de contraste net avec le fond.
+
     border_px = int(size_px * border_fraction)
     bordered = cv2.copyMakeBorder(
         marker, border_px, border_px, border_px, border_px,
