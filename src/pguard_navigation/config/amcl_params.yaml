@@ -12,17 +12,13 @@ amcl:
     initial_pose.z: 0.0
     initial_pose.yaw: 0.0
 
-    # Plus de particules + convergence plus fine (scan Velodyne bruite)
-    min_particles: 1000
     max_particles: 3000
 
-    # Correction beaucoup plus frequente : au lieu d'attendre 15cm/0.15rad de
-    # deplacement estime, on recale des le moindre mouvement significatif.
+
     update_min_d: 0.05
     update_min_a: 0.05
 
-    # Modele laser adapte a un scan issu de projection 3D->2D (plus de bruit
-    # que sur un LiDAR 2D natif : sigma_hit augmente, z_rand augmente).
+
     laser_model_type: "likelihood_field"
     laser_likelihood_max_dist: 2.5
     laser_max_range: 20.0
@@ -35,8 +31,6 @@ amcl:
     sigma_hit: 0.25
     lambda_short: 0.1
 
-    # Modele de mouvement : coefficients de bruit realistes pour une base
-    # differentielle/skid-steer (a ajuster selon ton robot reel).
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     alpha1: 0.15
     alpha2: 0.15
@@ -47,8 +41,7 @@ amcl:
     transform_tolerance: 0.3
     tf_broadcast: true
 
-    # Rejette un scan si sa transformation TF est trop en retard, evite de
-    # localiser sur des donnees perimees.
+
     resample_interval: 1
     recovery_alpha_slow: 0.001
     recovery_alpha_fast: 0.1
