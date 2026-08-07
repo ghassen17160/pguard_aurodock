@@ -46,9 +46,7 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
-# Enregistre automatiquement models/ dans GAZEBO_MODEL_PATH a chaque
-# "source install/setup.bash", pour que Gazebo resolve les URI
-# model://pguard_charging_station/... (materiau AprilTag) sans configuration
+
 # manuelle (export dans .bashrc). Meme mecanisme que turtlebot3_gazebo.
 ament_environment_hooks(
   "${CMAKE_CURRENT_SOURCE_DIR}/env-hook/pguard_autodock_gazebo_paths.sh.in"
