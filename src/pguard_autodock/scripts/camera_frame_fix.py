@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""
-camera_frame_fix.py
-Package pguard_autodock
 
-Contournement d'un comportement de libgazebo_ros_camera.so (Gazebo Classic) :
-malgre <frameName>camera_link</frameName> correctement renseigne dans le SDF
-genere, le plugin publie /camera/image_raw et /camera/camera_info avec un
-header.frame_id errone (constate : 'base_footprint', vraisemblablement le
-lien canonique du modele plutot que le lien reel de la camera). Le rendu de
-l'image lui-meme reste correct (la camera est bien physiquement simulee a la
-pose de camera_link) -- seule l'ETIQUETTE dans le header est fausse.
-
-Consequence : apriltag_ros calcule la pose du tag dans la convention optique
-de la camera, mais la publie via TF comme si son parent etait directement le
-frame_id recu (donc 'base_footprint', sans le veritable offset/rotation de
-la camera) -- d'ou des positions/orientations de tag totalement incoherentes
-une fois recomposees dans base_link.
-
-Ce noeud relaie /camera/image_raw et /camera/camera_info en corrigeant
-uniquement le header.frame_id vers le VRAI repere optique de la camera
-(camera_link_optical, cf. patch xacro correspondant), sans autre
-transformation des donnees. apriltag_ros doit ensuite etre pointe sur les
-topics corriges (/camera_fixed/image_raw, /camera_fixed/camera_info) via les
-arguments image_topic/camera_info_topic du launch.
-"""
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
