@@ -15,14 +15,9 @@ def generate_launch_description():
         output='screen',
         parameters=[params_file],
         remappings=[
-            # RViz2 publie l'outil "2D Goal Pose" sur /goal_pose par défaut
-            # (contrairement à ROS1 où "2D Nav Goal" publiait sur
-            # /move_base_simple/goal, topic écouté en dur dans le node).
+
             ('/move_base_simple/goal', '/goal_pose'),
-            # Décommentez et adaptez si vos autres topics ont un namespace :
-            # ('/odom', '/pguard/odom'),
-            # ('/scan', '/pguard/scan'),
-            # ('/cmd_vel', '/pguard/cmd_vel'),
+
         ],
     )
 
