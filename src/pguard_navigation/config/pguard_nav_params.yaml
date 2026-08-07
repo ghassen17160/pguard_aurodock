@@ -6,55 +6,34 @@ prm_nav_node:
     map_frame: "map"
     base_frame: "base_footprint"
 
-    # --- Carte / costmap local (couvre 40m x 40m autour du robot) ---
+    # --- Carte 
     map_width: 400
     map_height: 400
     resolution: 0.10
 
-    # --- Securite / eloignement des obstacles ---
-    # inflation_radius: rayon (m) sur lequel le cout augmente autour d'un obstacle.
-    # safety_buffer: doit rester STRICTEMENT < inflation_radius. Plus il s'en rapproche,
-    #   plus le seuil de cout "libre" (safe_cost_threshold, calcule automatiquement et
-    #   affiche au demarrage) est bas -> le PRM est oblige de rester loin des obstacles.
-    #   ATTENTION: si vos couloirs les plus etroits sont proches de 2*safety_buffer de
-    #   large, le PRM risque de ne plus trouver de chemin ("Le PRM n'a pas trouve de
-    #   chemin"). Reduisez alors safety_buffer.
+
     inflation_radius: 1.20
-    # safety_buffer: revenu a 0.45 (valeur de votre ancien fichier qui fonctionnait bien).
-    #   0.65 puis 0.52 se sont reveles trop stricts pour la largeur reelle de vos couloirs.
-    #   Ne le remontez que par petits pas de +0.03 en testant a chaque fois.
+
     safety_buffer: 0.45
-    # prm_clearance_weight: SEUL levier change par rapport aux valeurs par defaut du code.
-    #   Defaut = 0.6. Augmente ici pour eloigner le chemin global des obstacles, comme
-    #   demande -- c'est un levier "doux" (objectif d'optimisation, pas une contrainte
-    #   dure), donc plus sur a ajuster seul que safety_buffer.
+
     prm_clearance_weight: 0.9
     invalid_path_confirm_count: 6
 
-    # --- Geometrie robot (chassis 1.4 x 0.75 x 0.60 m, base_link decale vers l'arriere) ---
-    # footprint_front + footprint_back doit correspondre a la longueur totale du chassis.
     footprint_front: 0.80
     footprint_back: 0.60
     footprint_half_width: 0.46
-    # footprint_safety_margin: marge de securite REELLE ajoutee autour de l'empreinte pour
-    #   la detection de collision temps reel du DWA (evitement d'obstacles dynamiques).
-    #   Augmentez si le robot reel est plus large que la geometrie ci-dessus, ou si
-    #   l'odometrie est bruitee.
+
     footprint_safety_margin: 0.12
     obstacle_grid_cell_size: 0.3
 
-    # --- Cinematique (robot lourd, roues 0.4m de diametre, 80kg) ---
     max_linear_vel: 0.40
     max_angular_vel: 0.30
-    max_linear_accel: 0.7      # revenu a la valeur par defaut du code (0.35 degradait le DWA)
-    max_angular_accel: 2.0     # revenu a la valeur par defaut du code (0.8 degradait le DWA)
+    max_linear_accel: 0.7     
+    max_angular_accel: 2.0    
 
-    # --- Suivi de trajectoire (pure pursuit) ---
+  
     lookahead_dist: 0.60
-    # min_lookahead_dist: remis a 0.8 (valeur par defaut du code, jamais fixee dans votre
-    #   ancien fichier). Comme min > lookahead_dist ici, le lookahead adaptatif reste en
-    #   pratique constant a 0.8m quel que soit le virage -- c'est le comportement exact
-    #   avec lequel votre robot naviguait bien, on ne le change plus.
+
     min_lookahead_dist: 0.8
     lookahead_curvature_full_reduction: 1.2
     local_plan_dt: 0.10
@@ -98,7 +77,7 @@ prm_nav_node:
     max_recovery_attempts: 3
 
     # --- Capteur / boucle de controle ---
-    scan_stride: 3              # n'affecte QUE la visualisation RViz (securite en pleine densite)
+    scan_stride: 3             
     control_period: 0.05
 
     # --- Couleur du marker de trajectoire locale (topic local_path_marker) ---
